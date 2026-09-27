@@ -48,9 +48,9 @@ Rather than one dense diagram, here are **five focused views** that each tell on
 
 ---
 
-### Diagram 1 — The 40,000-foot view (5 layers, no cross-arrows)
+### Diagram 1 — The 40,000-foot view (5 layers, services expanded)
 
-Just the layer stack. Answers "**what kinds of things are inside the Velo backend?**" — nothing about who calls whom.
+Just the layer stack. Answers "**what kinds of things are inside the Velo backend?**" — every service is visible, but there are no cross-arrows so the layout stays readable.
 
 ```mermaid
 flowchart TB
@@ -68,9 +68,31 @@ flowchart TB
       A3[Webhook Receiver<br/>mTLS + HMAC + replay window]:::ing
     end
 
-    subgraph L3["3  Domain Services  (modular monolith)"]
-      direction LR
-      S[10 domain services  +  1 Sponsor-Bank Adapter]:::svc
+    subgraph L3["3  Domain Services  (modular monolith — 10 modules + 1 anti-corruption layer)"]
+      direction TB
+      subgraph L3a["Customer-facing"]
+        direction LR
+        S1[Identity<br/>Cognito facade]:::svc
+        S2[Onboarding]:::svc
+        S3[Account]:::svc
+        S4[Transfers]:::svc
+        S5[PayID]:::svc
+      end
+      subgraph L3b["Money movement"]
+        direction LR
+        S6[Payments-In]:::svc
+        S7[Interest]:::svc
+        S8[Ledger<br/><i>sole writer to postings</i>]:::hub
+      end
+      subgraph L3c["Support / Ops"]
+        direction LR
+        S9[Reconciliation]:::svc
+        S10[Notifications]:::svc
+      end
+      subgraph L3d["Anti-Corruption Layer"]
+        direction LR
+        SB[Sponsor-Bank Adapter<br/><i>only sponsor-touching module</i>]:::acl
+      end
     end
 
     subgraph L4["4  Data + Messaging"]
@@ -95,15 +117,151 @@ flowchart TB
     classDef cli fill:#dbeafe,stroke:#1e40af,color:#111
     classDef ing fill:#bfdbfe,stroke:#1e3a8a,color:#111
     classDef svc fill:#dcfce7,stroke:#166534,color:#111
+    classDef hub fill:#bbf7d0,stroke:#14532d,color:#111,stroke-width:3px
+    classDef acl fill:#e9d5ff,stroke:#6b21a8,color:#111,stroke-width:2px
     classDef data fill:#fef3c7,stroke:#92400e,color:#111
     classDef ext fill:#e5e7eb,stroke:#374151,color:#111
 ```
 
-**How to read it.** Every arrow from the outside world lands on layer 2 (Ingress). Ingress calls into layer 3 (Domain Services). Services read/write layer 4 (Data + Messaging). Only a small subset of services reach out to layer 5 (External partners) — always through the Sponsor-Bank Adapter (for the sponsor) or through Cognito/SES/Twilio/APNs (for identity + notifications).
+**How to read it.** Every arrow from the outside world lands on layer 2 (Ingress). Ingress calls into layer 3 (Domain Services — now expanded into all 11 modules, grouped by role). Services read/write layer 4 (Data + Messaging). Only a small subset reach out to layer 5 (External partners) — always through the Sponsor-Bank Adapter (for the sponsor) or through Cognito / SES / Twilio / APNs (for identity + notifications).
 
 ---
 
-### Diagram 2 — Request-driven flows (who serves each API, and who they call)
+### Diagram 2 — Everything at a glance (single-page comprehensive)
+
+Everything a Velo engineer needs on one page — **every service, every store, every messaging surface visible**, but with cross-arrows kept to the essential story-telling ones. If you had to print one diagram and pin it above your desk, this would be it.
+
+Diagrams 3–6 are the same thing sliced by trigger type (request / event / schedule / boundary). Come back to this one when you want the whole picture at once.
+
+```mermaid
+flowchart TB
+    %% ─── Top row: clients, plus the sponsor as SOURCE of the inbound webhook ───
+    subgraph Clients
+      direction LR
+      CA[Customer App]:::cli
+      OW[Ops Portal]:::cli
+      SP1([Sponsor Bank<br/>sends NPP webhook +<br/>drops SFTP files]):::ext
+    end
+
+    %% ─── Ingress ───
+    subgraph Ingress["Ingress  (3 API surfaces)"]
+      direction LR
+      CAPI[Customer API]:::ing
+      OAPI[Ops API]:::ing
+      WHR[Webhook Receiver]:::ing
+    end
+
+    %% ─── Domain services ───
+    subgraph Domain["Velo Domain Services  (modular monolith)"]
+      direction LR
+      subgraph CustGrp["Customer-facing"]
+        direction TB
+        Id[Identity]:::svc
+        Onb[Onboarding]:::svc
+        Acc[Account]:::svc
+        Tx[Transfers]:::svc
+        PS[PayID]:::svc
+      end
+      subgraph MoneyGrp["Money movement"]
+        direction TB
+        PIn[Payments-In]:::svc
+        Int[Interest]:::svc
+        Led[Ledger<br/><i>sole writer</i>]:::hub
+      end
+      subgraph SupGrp["Support / Ops"]
+        direction TB
+        Recon[Reconciliation]:::svc
+        Notif[Notifications]:::svc
+      end
+    end
+
+    %% ─── ACL + the sponsor as RECEIVER of our REST calls ───
+    subgraph AclRow[" "]
+      direction LR
+      SBA[Sponsor-Bank Adapter<br/><i>only sponsor-touching module</i>]:::acl
+      SP2([Sponsor Bank<br/>receives REST + SFTP]):::ext
+    end
+
+    %% ─── Data + messaging ───
+    subgraph DataMsg["Data + Messaging"]
+      direction LR
+      PG[(Postgres)]:::data
+      Rd[(Redis)]:::data
+      Ob[(Outbox<br/>in Postgres)]:::data
+      Kf[[Kafka]]:::data
+      Sq[/SQS/]:::data
+      S3K[(S3 KYC)]:::data
+      S3I[(S3 inbound-files)]:::data
+      S3A[(S3 audit-lake)]:::data
+    end
+
+    %% ─── Scheduler ───
+    subgraph Sched["Scheduler"]
+      direction LR
+      Cr[EventBridge cron]:::infra
+      Jb[Interest · Recon · SFTP · Cleanup jobs]:::job
+    end
+
+    %% ═══ ~20 arrows total — grouped where possible ═══
+
+    %% Client → Ingress (3)
+    CA --> CAPI
+    OW --> OAPI
+    SP1 ==>|mTLS webhook| WHR
+
+    %% Ingress → Domain (3 group-level arrows, not 11 individual)
+    CAPI --> CustGrp
+    OAPI --> Domain
+    WHR --> MoneyGrp
+
+    %% Domain state ownership (3 arrows, not 8 individual)
+    Domain --> PG
+    MoneyGrp --> Rd
+    Onb --> S3K
+
+    %% Event backbone (5)
+    Domain --> Ob
+    Ob -->|Debezium CDC| Kf
+    Kf --> Notif
+    Kf --> S3A
+    Notif --> Sq
+
+    %% Sponsor boundary — one funnel through the ACL (4)
+    MoneyGrp --> SBA
+    PS --> SBA
+    Recon --> SBA
+    SBA ==>|REST + mTLS| SP2
+
+    %% Scheduler → services + inbound files (3)
+    Cr --> Jb
+    Jb --> MoneyGrp
+    Jb -.->|SFTP puller<br/>writes raw files;<br/>S3 event → SQS → Payments-In / Recon| S3I
+
+    classDef cli fill:#dbeafe,stroke:#1e40af,color:#111
+    classDef ing fill:#bfdbfe,stroke:#1e3a8a,color:#111
+    classDef svc fill:#dcfce7,stroke:#166534,color:#111
+    classDef hub fill:#bbf7d0,stroke:#14532d,color:#111,stroke-width:3px
+    classDef acl fill:#e9d5ff,stroke:#6b21a8,color:#111,stroke-width:2px
+    classDef data fill:#fef3c7,stroke:#92400e,color:#111
+    classDef infra fill:#fed7aa,stroke:#9a3412,color:#111
+    classDef job fill:#fff7ed,stroke:#9a3412,color:#111
+    classDef ext fill:#e5e7eb,stroke:#374151,color:#111
+```
+
+> **`SP1` and `SP2` are the same external Sponsor Bank** — shown twice for layout clarity. `SP1` is the sponsor as *sender* (NPP webhook + SFTP files → into us). `SP2` is the sponsor as *receiver* (REST / SFTP called *from* our Sponsor-Bank Adapter). Splitting the node keeps the diagram flowing top-to-bottom without a long backward arrow crossing the whole canvas.
+>
+> **SFTP inbound chain shown as one collapsed arrow.** The label on the `Jb -.-> S3I` edge tells the whole story: SFTP puller drops raw files into S3 → S3 event fires SQS → Payments-In and Recon consume. Full detail lives in Diagrams 5 and 6.
+
+**Reading this diagram in three passes:**
+1. **Vertical spine** — Clients → Ingress → Domain → Data / Messaging. This is the request path for anything that comes in via HTTP.
+2. **ACL row (just below Domain)** — every sponsor-touching service (Payments-In, PayID, Reconciliation) funnels through the single Sponsor-Bank Adapter, which is the *only* code that talks to the sponsor.
+3. **Scheduler (bottom)** — cron-driven work. Two outputs: (a) triggers money-movement services on a schedule, (b) pulls files from the sponsor via SFTP and drops them into S3.
+
+**Arrow-reduction technique** — instead of drawing an arrow from every service to Postgres (8 arrows), a single arrow from the `Domain` subgraph to `PG` says "every service in Domain owns rows in Postgres". Same trick for `Ingress → Domain`, `Domain → Outbox`, and the sponsor funnel. Total: ~20 arrows for ~26 visible nodes — less than half the old diagram's edge count. When you need per-service granularity, jump to Diagrams 3–6.
+
+---
+
+### Diagram 3 — Request-driven flows (who serves each API, and who they call)
 
 Ingress on the left, services in the middle grouped by their primary purpose, boundary on the right. Answers "**when a real HTTP request comes in, which code paths run?**"
 
@@ -181,7 +339,7 @@ flowchart LR
 
 ---
 
-### Diagram 3 — Event-driven flows (async backbone)
+### Diagram 4 — Event-driven flows (async backbone)
 
 Answers "**after a service commits a change, how does the rest of the system find out?**" This is the outbox → Kafka → consumers backbone.
 
@@ -236,7 +394,7 @@ flowchart LR
 
 ---
 
-### Diagram 4 — Scheduled flows (internal cron jobs)
+### Diagram 5 — Scheduled flows (internal cron jobs)
 
 Answers "**what runs on a timer, not on a request?**"
 
@@ -283,7 +441,7 @@ flowchart LR
 
 ---
 
-### Diagram 5 — External boundary (Sponsor-Bank Adapter detail)
+### Diagram 6 — External boundary (Sponsor-Bank Adapter detail)
 
 Answers "**how does Velo's world connect to the sponsor's world?**" This is the anti-corruption layer close-up.
 
@@ -400,7 +558,7 @@ Any code path that mutates money or state ultimately traces back to one of these
 
 ## Sync-call rules of thumb
 
-The exact who-calls-whom picture is in **Diagram 2** above. The invariants worth memorising:
+The exact who-calls-whom picture is in **Diagram 3** above. The invariants worth memorising:
 
 - **Only three services call `Ledger`**: Transfers, Payments-In, Interest. Anyone else touching money is a bug.
 - **Only three services call `Sponsor-Bank Adapter`**: Payments-In (statement pulls + roadmap outbound), PayID (registration), Reconciliation (position queries). All external side effects are contained in one adapter.
