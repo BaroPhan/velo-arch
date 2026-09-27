@@ -83,6 +83,7 @@ erDiagram
     ACCOUNT ||--o{ INTEREST_ACCRUAL : "accrues"
     INTEREST_ACCRUAL ||--o| TRANSACTION : "capitalised by"
     PRODUCT ||--o{ RATE_VERSION : "has"
+    RATE_VERSION ||--o{ INTEREST_ACCRUAL : "priced by"
     ACCOUNT ||--|| PRODUCT : "is"
 
     PRODUCT {

@@ -86,7 +86,7 @@ sequenceDiagram
 ## Alternative flows
 
 - **Account not found / typo in account number** → record moves to an **"unmatched credits"** queue in the Ops portal. Ops has 2 business days to resolve; otherwise a **return DE** is initiated (this uses the outbound path which is roadmap, so in MVP we settle it manually via the sponsor's ops channel).
-- **Account frozen** (AML hold) → credit is accepted into the ledger but posted to a **hold sub-account** owned by the customer; balance is not available until released.
+- **Account frozen** (AML hold) → credit is accepted into the ledger but posted to a **`CUSTOMER_HELD_AML` ledger position** owned by the same customer account (`ACCOUNT ||--o{ LEDGER_ACCOUNT`). The customer's `CUSTOMER_AVAILABLE` balance does not move. Ops releases the funds via a follow-up `INTERNAL_TRANSFER` transaction from `CUSTOMER_HELD_AML` → `CUSTOMER_AVAILABLE`. See [`docs/08-workflow-qa.md § Q5`](../08-workflow-qa.md#q5-account-frozen-aml-hold--posted-to-a-hold-sub-account-owned-by-the-customer--does-that-mean-the-customer-has-2-accounts-contradicting-1-customer-1-account-1-ledger).
 - **Duplicate file** (sponsor re-sends) → the ingest job dedupes by `file_id`; postings dedupe by `external_ref` acting as an idempotency key at the ledger level.
 - **Partial file parse failure** → the whole file is quarantined; Ops paged; a manual re-ingest is possible once fixed. Never partial-apply a DE file.
 - **Recon break** → automatic re-run at T+30 min; if still broken, block outbound DE (roadmap) and escalate.
@@ -95,7 +95,7 @@ sequenceDiagram
 
 ```mermaid
 erDiagram
-    ACCOUNT ||--|| LEDGER_ACCOUNT : projects
+    ACCOUNT ||--o{ LEDGER_ACCOUNT : "has ledger position(s)"
     LEDGER_ACCOUNT ||--o{ POSTING : has
     TRANSACTION ||--|{ POSTING : "composed of (>=2)"
     PAYMENT_INSTRUCTION ||--o| TRANSACTION : results_in
@@ -154,7 +154,7 @@ erDiagram
     LEDGER_ACCOUNT {
         uuid id PK
         uuid account_id FK "nullable for control accounts"
-        string account_class "CUSTOMER|SPONSOR_POOL|SUSPENSE|INTEREST_EXPENSE|UNMATCHED_CREDITS|HOLD"
+        string account_class "CUSTOMER_AVAILABLE|CUSTOMER_HELD_AML|CUSTOMER_PENDING|SPONSOR_POOL|SUSPENSE|INTEREST_EXPENSE|ATO_WITHHOLDING_PAYABLE|UNMATCHED_CREDITS"
         string currency
         bigint available_balance_cents
         bigint pending_balance_cents
@@ -175,8 +175,12 @@ erDiagram
         uuid recon_run_id FK
         string type "MISSING|EXTRA|AMOUNT_MISMATCH"
         jsonb details
-        string status "OPEN|RESOLVED"
-        uuid resolved_by_user_id
+        string status "OPEN|IN_REVIEW|RESOLVED|ESCALATED"
+        string resolution_action "NO_ACTION|ADJUSTMENT_POSTED|ESCALATED_TO_SPONSOR"
+        text resolution_notes
+        uuid proposed_by_ops_user_id FK
+        uuid confirmed_by_ops_user_id FK "4-eyes; must differ from proposed_by"
+        timestamp resolved_at
     }
 ```
 

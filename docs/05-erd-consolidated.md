@@ -24,13 +24,14 @@ erDiagram
     APPLICATION ||--o{ APPLICATION_DECISION : "has"
     CUSTOMER ||--o{ ACCOUNT : "owns"
     ACCOUNT ||--|| PRODUCT : "of type"
-    ACCOUNT ||--|| LEDGER_ACCOUNT : "projected as"
+    ACCOUNT ||--o{ LEDGER_ACCOUNT : "has ledger position(s)"
     ACCOUNT ||--o{ PAYID_REGISTRATION : "aliases"
     ACCOUNT ||--o{ INTEREST_ACCRUAL : "accrues"
     ACCOUNT ||--o{ PAYEE : "is target of"
     CUSTOMER ||--o{ PAYEE : "saves"
 
     PRODUCT ||--o{ RATE_VERSION : "priced by"
+    RATE_VERSION ||--o{ INTEREST_ACCRUAL : "priced by"
     LEDGER_ACCOUNT ||--o{ POSTING : "has"
     TRANSACTION ||--|{ POSTING : "composed of"
     TRANSACTION ||--o{ OUTBOX_EVENT : "emits"
@@ -43,6 +44,7 @@ erDiagram
 
     OPS_USER ||--o{ APPLICATION_DECISION : "made by"
     OPS_USER ||--o{ RATE_VERSION : "approved by"
+    OPS_USER ||--o{ RECON_BREAK : "proposed / confirmed"
     OPS_USER ||--o{ AUDIT_LOG : "acted"
 
     CUSTOMER {
@@ -145,7 +147,7 @@ erDiagram
     LEDGER_ACCOUNT {
         uuid id PK
         uuid account_id FK "nullable for control accounts"
-        string account_class "CUSTOMER|SPONSOR_POOL|SUSPENSE|INTEREST_EXPENSE|UNMATCHED_CREDITS|HOLD"
+        string account_class "CUSTOMER_AVAILABLE|CUSTOMER_HELD_AML|CUSTOMER_PENDING|SPONSOR_POOL|SUSPENSE|INTEREST_EXPENSE|ATO_WITHHOLDING_PAYABLE|UNMATCHED_CREDITS"
         string currency "AUD"
         bigint available_balance_cents
         bigint pending_balance_cents
@@ -274,8 +276,12 @@ erDiagram
         uuid recon_run_id FK
         string type "MISSING|EXTRA|AMOUNT_MISMATCH"
         jsonb details
-        string status "OPEN|RESOLVED"
-        uuid resolved_by_ops_user_id
+        string status "OPEN|IN_REVIEW|RESOLVED|ESCALATED"
+        string resolution_action "NO_ACTION|ADJUSTMENT_POSTED|ESCALATED_TO_SPONSOR"
+        text resolution_notes
+        uuid proposed_by_ops_user_id FK
+        uuid confirmed_by_ops_user_id FK "4-eyes; must differ from proposed_by"
+        timestamp resolved_at
     }
 
     OPS_USER {

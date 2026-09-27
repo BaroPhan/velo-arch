@@ -93,7 +93,7 @@ erDiagram
     CUSTOMER ||--o{ CUSTOMER_ADDRESS : "has"
     CUSTOMER ||--o{ CUSTOMER_CONSENT : "grants"
     CUSTOMER ||--o{ ACCOUNT : "owns"
-    ACCOUNT ||--|| LEDGER_ACCOUNT : "is projected as"
+    ACCOUNT ||--o{ LEDGER_ACCOUNT : "has ledger position(s)"
 
     CUSTOMER {
         uuid id PK
@@ -181,7 +181,7 @@ erDiagram
 **Relations recap**
 - One `CUSTOMER` has 0..* `APPLICATION`s (they can re-apply); once approved, exactly one `ACCOUNT` in MVP.
 - One `APPLICATION` has many `APPLICATION_DOCUMENT`s and many `APPLICATION_DECISION`s (submit + confirm).
-- One `ACCOUNT` has exactly one `LEDGER_ACCOUNT` — the ledger is the source of truth for balance; `ACCOUNT` holds the "product" view.
+- One `ACCOUNT` has one **primary** `LEDGER_ACCOUNT` (`CUSTOMER_AVAILABLE`) plus 0..N additional positions for holds/pending (e.g. `CUSTOMER_HELD_AML`). The ledger is the source of truth for balance; `ACCOUNT` holds the "product" view. On issuance we open only the `CUSTOMER_AVAILABLE` position.
 - `CUSTOMER_ADDRESS` / `CUSTOMER_CONSENT` are versioned lists, never mutated in place, for audit.
 
 ## How our services interact at the cloud level
