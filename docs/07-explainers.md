@@ -212,6 +212,103 @@ Under a very simplified convention (using +/− against natural balance):
 - The `LEDGER_ACCOUNT.balance` column is a **projection** — we can always recompute it from the postings.
 - If sponsor and Velo disagree, we have both sides of the truth: the sponsor's real ES account movements and Velo's postings against the sponsor pool.
 
+### The "other side" — double-entry with external counterparties
+
+**A common (and important) confusion:**
+
+> "When money flows in from an external bank, only the sponsor sees the debit from that external bank. From Velo's side we only see a credit arriving. So how can we do double-entry — where's our debit?"
+
+Short answer: **double-entry balances within a single entity's own books, not across the whole world.** Every entity (external bank, RBA, sponsor, Velo) keeps its own set of books, and each entity's books balance **internally**. Velo does not — and should not — book the other bank's debit. We record the two sides that touch **us**, and the debit side is our **own** asset (the Sponsor Pool) going up.
+
+Let me walk it through end-to-end using the payroll example from workflow 02:
+- **Acme** in Melbourne pays employee **David** $2,450 via DE.
+- Acme's bank is **ANZ**.
+- Velo's sponsor bank is a mid-tier ADI ("Sponsor").
+- David is a Velo customer.
+
+Four entities keep books. Each pair of entries balances internally.
+
+**1. ANZ's books** *(payer's bank)*
+
+| DR / CR | Account | Class | Direction | Amount |
+|---|---|---|---|---|
+| DR | Acme's transaction account | Liability | ▼ (ANZ no longer owes Acme this money) | $2,450 |
+| CR | Amounts due to other ADIs (BECS clearing) | Liability | ▲ | $2,450 |
+
+Balances ✓. ANZ has swapped an obligation to Acme for an obligation to another ADI via the clearing house.
+
+**2. RBA settlement** *(between ADIs, on the RBA's own books)*
+
+| DR / CR | Account | Class | Direction | Amount |
+|---|---|---|---|---|
+| DR | ANZ's Exchange Settlement account | Liability (RBA owes ANZ) | ▼ | $2,450 |
+| CR | Sponsor's Exchange Settlement account | Liability (RBA owes Sponsor) | ▲ | $2,450 |
+
+Balances ✓. Real central-bank money moves from ANZ to Sponsor.
+
+**3. Sponsor's books**
+
+| DR / CR | Account | Class | Direction | Amount |
+|---|---|---|---|---|
+| DR | Cash at RBA | Asset | ▲ | $2,450 |
+| CR | Velo Pool Account (liability owed to Velo) | Liability | ▲ | $2,450 |
+
+Balances ✓. Sponsor received central-bank money **and** owes Velo the same amount.
+
+**4. Velo's books** *(ours — this is where the "we can only see the credit" confusion lives)*
+
+| DR / CR | Account | Class | Direction | Amount |
+|---|---|---|---|---|
+| **DR** | **Cash at Sponsor Pool** | **Asset** | ▲ (our claim on the sponsor grew) | **$2,450** |
+| **CR** | **Customer Deposit — David** | **Liability** | ▲ (we now owe David more) | **$2,450** |
+
+Balances ✓.
+
+**Read that Velo row carefully:**
+- Our debit is **not** "ANZ's debit of Acme's account". That belongs on ANZ's books, not ours.
+- Our debit is **our own asset going up** — the pool at the sponsor grew by $2,450.
+- Our credit is **our own liability going up** — David is owed $2,450 more.
+- We got the information for **both entries** from the same sponsor message; we just booked them on **our** balance sheet.
+
+**Reframe what the sponsor's inbound message is telling us.** When the sponsor calls our NPP webhook or drops a DE file, they are simultaneously communicating **two facts, both of which live on our books**:
+
+| The sponsor's message says... | Which on our books becomes... |
+|---|---|
+| "Your pool with me just went up by $2,450 because inbound message X arrived" | **DR** `Cash at Sponsor Pool` +$2,450 |
+| "...here is the beneficiary account, remitter name, and reference — this payment is for `BSB 802-985 / Acct 100 234 567`" | Enough to resolve to David → **CR** `Customer Deposit — David` +$2,450 |
+
+That is exactly why our Payments-In service posts a **single transaction with two postings** — the sponsor's message carries all the info we need to book both sides of *our own* double-entry. We are never missing "the other side"; the other side is always **our own asset moving**.
+
+**Where reconciliation fits in.** Double-entry gives us **internal consistency** on our own books:
+
+```
+sum of all customer sub-ledger balances (liability)  ==  Cash at Sponsor Pool (asset)
+```
+
+Reconciliation gives us **external consistency** — a daily check that our version of "Cash at Sponsor Pool" equals the sponsor's version of "Velo Pool Account":
+
+```
+Velo.SUM(postings to Sponsor Pool today)  ==  Sponsor.movements to Velo Pool Account today
+```
+
+If those disagree, someone is wrong (and either can be — bugs and file corruption happen on both sides). This is why we keep both **`INBOUND_MESSAGE.raw_payload`** and the sponsor's daily statement file in S3 with Object Lock — evidence for either direction of investigation.
+
+**One more mental model.** Every entity records only the transactions that **cross its own balance-sheet boundary**:
+- ANZ crosses its own boundary once (Acme's account down, clearing liability up).
+- RBA crosses its own boundary once (between two ES accounts).
+- Sponsor crosses its own boundary once (RBA cash up, Velo pool liability up).
+- Velo crosses its own boundary once (Sponsor Pool asset up, Customer Deposit liability up).
+
+**Four independent balanced pairs, all reflecting the same real-world event.** No single entity sees all four; no single entity needs to. That's the elegance (and the challenge) of a distributed financial system.
+
+**Anti-example — what would break this.** Suppose we naively wrote:
+
+```
+CR  Customer Deposit — David  +$2,450     -- only one posting!
+```
+
+Now Velo's books don't balance — total credits exceed total debits by $2,450. The balance sheet identity is violated. There is no matching entry showing where that money "came from" (our claim on the sponsor). Auditors would immediately notice; reconciliation would eventually notice; but worst of all, the *concept* of David owning that money would be untethered from the fact that Velo actually has the money at the sponsor to back it. Double-entry, properly applied to *our own books*, is what welds those two facts together.
+
 ### Sub-ledger vs General Ledger (GL)
 
 Two different views of the same money at different levels of granularity.
