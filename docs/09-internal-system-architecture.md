@@ -24,154 +24,325 @@ Complements `docs/06-cloud-architecture.md`, which is the **outside/deployment**
 
 ---
 
-## Architecture at a glance (one diagram)
+## Architecture in layers
+
+Rather than one dense diagram, here are **five focused views** that each tell one story. Read them in order — each reuses shape/colour conventions from the previous one.
+
+### Legend (shared across all diagrams)
+
+| Shape / arrow | Meaning |
+|---|---|
+| **Rectangle** | Application service or module |
+| **Cylinder** `(( ))` | Data store (Postgres / Redis / S3) |
+| **Trapezoid** `/[ ]/` | Queue (SQS) |
+| **Subroutine bar** `[[ ]]` | Event log (Kafka topic) |
+| **Rounded** `([ ])` | External system |
+| **Solid arrow `-->`** | Synchronous call (HTTP / gRPC / in-process) |
+| **Dashed arrow `-.->`** | Asynchronous event / message |
+| **Thick arrow `==>`** | External ingress crossing our security boundary |
+| Blue fill | Ingress (public-ish entry points) |
+| Green fill | Domain services (our code) |
+| Yellow fill | Data stores |
+| Grey fill | External systems |
+| Purple fill | Boundary / anti-corruption layer |
+
+---
+
+### Diagram 1 — The 40,000-foot view (5 layers, no cross-arrows)
+
+Just the layer stack. Answers "**what kinds of things are inside the Velo backend?**" — nothing about who calls whom.
 
 ```mermaid
 flowchart TB
-    %% ================= Edges =================
-    subgraph Clients[Clients]
-      CustApp["Customer App<br/>(PWA + React Native)"]
-      OpsWeb["Ops Portal<br/>(internal web)"]
-      Sponsor(["Sponsor Bank<br/>(external)"])
+    subgraph L1["1  Clients"]
+      direction LR
+      C1[Customer App<br/>PWA + React Native]:::cli
+      C2[Ops Portal<br/>internal web]:::cli
+      C3([Sponsor Bank]):::ext
     end
 
-    %% ================= API Layer =================
-    subgraph APILayer["API Layer  (HTTPS ingress into the backend)"]
-      CustAPI["Customer API Gateway<br/>REST/JSON, JWT-authenticated"]
-      OpsAPI["Ops Portal API<br/>REST/JSON, Zero-Trust-only"]
-      WHIn["Sponsor Webhook Receiver<br/>REST/JSON, mTLS + HMAC"]
+    subgraph L2["2  Ingress  (3 API surfaces, HTTPS)"]
+      direction LR
+      A1[Customer API<br/>JWT + MFA]:::ing
+      A2[Ops Portal API<br/>Zero-Trust + RBAC + 4-eyes]:::ing
+      A3[Webhook Receiver<br/>mTLS + HMAC + replay window]:::ing
     end
 
-    %% ================= Domain Services =================
-    subgraph Domain["Domain Services  (Velo backend — modular monolith)"]
-      Onb["Onboarding<br/>Service"]
-      Id["Identity<br/>Service<br/>(Cognito facade)"]
-      Acc["Account<br/>Service"]
-      Led["Ledger<br/>Service<br/>(sole writer to postings)"]
-      Tx["Transfers<br/>Service"]
-      PIn["Payments-In<br/>Service"]
-      PSvc["PayID<br/>Service"]
-      Int["Interest<br/>Service"]
-      Recon["Reconciliation<br/>Service"]
-      Notif["Notifications<br/>Service"]
-      FraudStub["Fraud<br/>(stub in MVP,<br/>real engine in roadmap)"]
+    subgraph L3["3  Domain Services  (modular monolith)"]
+      direction LR
+      S[10 domain services  +  1 Sponsor-Bank Adapter]:::svc
     end
 
-    %% ================= ACL =================
-    subgraph ACL["Anti-Corruption Layer"]
-      SBA["Sponsor-Bank Adapter<br/>(only place the sponsor SDK / SFTP client lives)"]
+    subgraph L4["4  Data + Messaging"]
+      direction LR
+      D1[(Postgres<br/>1 schema per module)]:::data
+      D2[(Redis<br/>caches)]:::data
+      D3[[Kafka<br/>event bus]]:::data
+      D4[/SQS<br/>work queues/]:::data
+      D5[(S3<br/>KYC · inbound · audit)]:::data
     end
 
-    %% ================= Data =================
-    subgraph Data["Data Stores"]
-      PG[("Postgres<br/>schemas per module")]
-      Redis[("Redis<br/>idempotency + hot balance cache")]
-      S3In[("S3 inbound-files<br/>raw DE/NPP evidence")]
-      S3Kyc[("S3 KYC docs<br/>Object Lock + KMS-CMK")]
-      S3Aud[("S3 audit-lake<br/>7-yr Object Lock")]
+    subgraph L5["5  External partners"]
+      direction LR
+      E1([Cognito]):::ext
+      E2([SES / Twilio / APNs]):::ext
+      E3([Sponsor Bank<br/>SFTP + REST]):::ext
     end
 
-    %% ================= Messaging =================
-    subgraph Bus["Messaging"]
-      Outbox[("Postgres outbox table<br/>+ Debezium CDC")]
-      Kafka[["Kafka event bus<br/>topics: money.credited, money.debited,<br/>customer.onboarded, application.decided,<br/>account.frozen, rate.changed,<br/>interest.accrued/capitalised,<br/>recon.closed/break"]]
-      SqsFiles[/"SQS: s3-inbound-file-arrived"/]
-      SqsNotif[/"SQS: per-channel notification queues<br/>(email, sms, push)"/]
-      DLQ[/"SQS DLQs<br/>webhook-replay, file-replay, notif-fail"/]
-    end
+    L1 --> L2 --> L3 --> L4
+    L3 -.-> L5
 
-    %% ================= Scheduler =================
-    subgraph Sched["Scheduler  (internal cron)"]
-      Cron["EventBridge cron<br/>➜ triggers ECS scheduled tasks"]
-      JobIntAcc["Job: Interest accrual (daily 23:59 AEST)"]
-      JobIntCap["Job: Interest capitalisation (1st of month 00:05)"]
-      JobRecon["Job: Reconciliation (EOD ~19:15 AEST)"]
-      JobIntRecon["Job: Monthly interest recon (1st of month 06:00)"]
-      JobSFTP["Job: SFTP puller (every 1 min business hours)"]
-      JobCleanup["Job: Outbox cleanup, RFI-expiry, session-cleanup"]
-    end
-
-    %% ================= Client edges =================
-    CustApp -->|HTTPS + JWT| CustAPI
-    OpsWeb  -->|HTTPS + JWT via Zero-Trust| OpsAPI
-    Sponsor ==>|mTLS + HMAC webhook| WHIn
-    Sponsor <-. SFTP over VPN .-> JobSFTP
-    Sponsor <-. REST + mTLS .-> SBA
-
-    %% ================= API to services =================
-    CustAPI --> Onb
-    CustAPI --> Id
-    CustAPI --> Acc
-    CustAPI --> Tx
-    CustAPI --> PSvc
-    OpsAPI  --> Onb
-    OpsAPI  --> Acc
-    OpsAPI  --> Led
-    OpsAPI  --> Recon
-    OpsAPI  --> S3Kyc
-    WHIn    --> PIn
-    WHIn    --> PSvc
-
-    %% ================= Domain interactions =================
-    Onb  --> Acc
-    Onb  --> S3Kyc
-    Tx   --> Acc
-    Tx   --> Led
-    Tx   --> FraudStub
-    Tx   --> Redis
-    PIn  --> SBA
-    PIn  --> Acc
-    PIn  --> Led
-    PIn  --> Redis
-    Int  --> Led
-    PSvc --> SBA
-    Recon --> SBA
-    Recon --> Led
-
-    %% ================= Data ownership =================
-    Onb  --> PG
-    Acc  --> PG
-    Led  --> PG
-    Tx   --> PG
-    PIn  --> PG
-    Int  --> PG
-    PSvc --> PG
-    Recon --> PG
-
-    %% ================= Outbox / events =================
-    Led   --> Outbox
-    Onb   --> Outbox
-    Acc   --> Outbox
-    Int   --> Outbox
-    Recon --> Outbox
-    Outbox -->|Debezium tails WAL| Kafka
-    Kafka --> Notif
-    Kafka --> S3Aud
-    Kafka -.-> FraudStub
-    Notif --> SqsNotif
-
-    %% ================= Files =================
-    JobSFTP --> S3In
-    S3In -->|S3 Event| SqsFiles
-    SqsFiles --> PIn
-
-    %% ================= Schedulers =================
-    Cron --> JobIntAcc --> Int
-    Cron --> JobIntCap --> Int
-    Cron --> JobRecon --> Recon
-    Cron --> JobIntRecon --> Recon
-    Cron --> JobSFTP
-    Cron --> JobCleanup
-
-    %% ================= DLQs =================
-    PIn  -.-> DLQ
-    Notif -.-> DLQ
+    classDef cli fill:#dbeafe,stroke:#1e40af,color:#111
+    classDef ing fill:#bfdbfe,stroke:#1e3a8a,color:#111
+    classDef svc fill:#dcfce7,stroke:#166534,color:#111
+    classDef data fill:#fef3c7,stroke:#92400e,color:#111
+    classDef ext fill:#e5e7eb,stroke:#374151,color:#111
 ```
 
-**Read the diagram in three passes:**
-1. **Top row** — how the outside world enters (three ingress paths: customer JWT, ops via zero-trust, sponsor via mTLS webhook + SFTP).
-2. **Middle band** — the domain services, plus the one **Ledger** service that is the sole writer to the postings tables and the one **Sponsor-Bank Adapter** that is the sole talker to the sponsor.
-3. **Bottom band** — how data flows *after* a service acts: Postgres for state, outbox → Kafka for events, S3 for evidence and audit, SQS for point-to-point work queues.
+**How to read it.** Every arrow from the outside world lands on layer 2 (Ingress). Ingress calls into layer 3 (Domain Services). Services read/write layer 4 (Data + Messaging). Only a small subset of services reach out to layer 5 (External partners) — always through the Sponsor-Bank Adapter (for the sponsor) or through Cognito/SES/Twilio/APNs (for identity + notifications).
+
+---
+
+### Diagram 2 — Request-driven flows (who serves each API, and who they call)
+
+Ingress on the left, services in the middle grouped by their primary purpose, boundary on the right. Answers "**when a real HTTP request comes in, which code paths run?**"
+
+```mermaid
+flowchart LR
+    %% Ingress
+    subgraph Ing["Ingress"]
+      direction TB
+      CA[Customer API]:::ing
+      OA[Ops API]:::ing
+      WH[Webhook Receiver]:::ing
+    end
+
+    %% Services grouped by role
+    subgraph Auth["Identity"]
+      Id[Identity]:::svc
+    end
+    subgraph Cust["Customer-facing"]
+      Onb[Onboarding]:::svc
+      Acc[Account]:::svc
+      Tx[Transfers]:::svc
+      PS[PayID]:::svc
+    end
+    subgraph Money["Money movement"]
+      PIn[Payments-In]:::svc
+      Int[Interest]:::svc
+      Led[Ledger<br/><i>sole writer to postings</i>]:::hub
+    end
+    subgraph Ops["Ops-only"]
+      Recon[Reconciliation]:::svc
+    end
+    subgraph ACL["Anti-Corruption Layer"]
+      SBA[Sponsor-Bank Adapter<br/><i>sole talker to sponsor</i>]:::acl
+    end
+    SB([Sponsor Bank]):::ext
+
+    %% Ingress → services
+    CA --> Id
+    CA --> Onb
+    CA --> Acc
+    CA --> Tx
+    CA --> PS
+    OA --> Onb
+    OA --> Acc
+    OA --> Led
+    OA --> Recon
+    WH --> PIn
+    WH --> PS
+
+    %% Inter-service sync calls (only 3 services call Ledger)
+    Onb --> Acc
+    Tx --> Acc
+    Tx --> Led
+    PIn --> Acc
+    PIn --> Led
+    Int --> Led
+    Recon --> Led
+
+    %% Only 2 services talk to the sponsor (via the ACL)
+    PIn --> SBA
+    PS  --> SBA
+    Recon --> SBA
+    SBA ==> SB
+
+    classDef ing fill:#bfdbfe,stroke:#1e3a8a,color:#111
+    classDef svc fill:#dcfce7,stroke:#166534,color:#111
+    classDef hub fill:#bbf7d0,stroke:#14532d,color:#111,stroke-width:3px
+    classDef acl fill:#e9d5ff,stroke:#6b21a8,color:#111,stroke-width:2px
+    classDef ext fill:#e5e7eb,stroke:#374151,color:#111
+```
+
+**Two invariants to notice:**
+- **Only three services write to `Ledger`** — Transfers, Payments-In, Interest. Anyone else touching money is a bug.
+- **Only three services call `Sponsor-Bank Adapter`** — Payments-In, PayID, Reconciliation. The adapter is the single choke-point to the outside world.
+
+---
+
+### Diagram 3 — Event-driven flows (async backbone)
+
+Answers "**after a service commits a change, how does the rest of the system find out?**" This is the outbox → Kafka → consumers backbone.
+
+```mermaid
+flowchart LR
+    subgraph Producers["Producers (write to their own DB + outbox in one txn)"]
+      direction TB
+      P1[Ledger]:::svc
+      P2[Onboarding]:::svc
+      P3[Account]:::svc
+      P4[Interest]:::svc
+      P5[Reconciliation]:::svc
+      P6[PayID]:::svc
+    end
+
+    OB[(Outbox table<br/>in each service's Postgres schema)]:::data
+    CDC[Debezium CDC<br/>tails Postgres WAL]:::infra
+    KF[[Kafka topics<br/>money.credited / .debited / .moved<br/>customer.onboarded / .kyc_rejected<br/>account.opened / .frozen / .unfrozen<br/>rate.changed<br/>interest.accrued / .capitalised<br/>recon.closed / .break<br/>payid.registered / .deregistered]]:::data
+
+    Producers --> OB --> CDC --> KF
+
+    subgraph Consumers["Consumers  (MVP)"]
+      direction TB
+      C1[Notifications<br/>push + email + SMS]:::svc
+      C2[Audit-lake S3 sink<br/>7-yr Object Lock]:::data
+    end
+    subgraph Future["Consumers  (roadmap — plug in without touching producers)"]
+      direction TB
+      F1[Fraud engine]:::future
+      F2[AML / CTF reporting]:::future
+      F3[CDR data-holder]:::future
+      F4[Analytics warehouse]:::future
+    end
+
+    KF --> C1
+    KF --> C2
+    KF -.-> F1
+    KF -.-> F2
+    KF -.-> F3
+    KF -.-> F4
+
+    classDef svc fill:#dcfce7,stroke:#166534,color:#111
+    classDef data fill:#fef3c7,stroke:#92400e,color:#111
+    classDef infra fill:#fed7aa,stroke:#9a3412,color:#111
+    classDef future fill:#f3f4f6,stroke:#9ca3af,color:#374151,stroke-dasharray:5 5
+```
+
+**Key points:**
+- **Producers never call Kafka directly.** They insert into a Postgres `outbox_event` row inside their business transaction. Debezium picks it up post-commit.
+- **The same log serves MVP consumers and future consumers** — Fraud, AML, CDR, Analytics can subscribe later without any change to the producers. That's the roadmap-friendly seam the panel is looking for.
+- **Kafka retains for 7 days; the audit-lake S3 mirror retains for 7 years** (Object Lock in Compliance mode).
+
+---
+
+### Diagram 4 — Scheduled flows (internal cron jobs)
+
+Answers "**what runs on a timer, not on a request?**"
+
+```mermaid
+flowchart LR
+    Cron[EventBridge cron<br/>➜ triggers ECS scheduled tasks]:::infra
+
+    subgraph Jobs["Scheduled jobs"]
+      direction TB
+      J1[Interest accrual<br/>daily 23:59 AEST]:::job
+      J2[Interest capitalisation<br/>1st of month 00:05]:::job
+      J3[Daily reconciliation<br/>~19:15 AEST — DE + NPP + pool balance]:::job
+      J4[Monthly interest recon<br/>1st of month 06:00]:::job
+      J5[SFTP puller<br/>every 1 min · business hours]:::job
+      J6[Outbox cleanup · RFI-expiry ·<br/>session cleanup · balance sanity check]:::job
+    end
+
+    subgraph Targets["Services triggered"]
+      direction TB
+      Int[Interest]:::svc
+      Recon[Reconciliation]:::svc
+      SBA[Sponsor-Bank Adapter]:::acl
+      Onb[Onboarding]:::svc
+      Led[Ledger]:::svc
+      Id[Identity]:::svc
+    end
+
+    Cron --> J1 --> Int
+    Cron --> J2 --> Int
+    Cron --> J3 --> Recon
+    Cron --> J4 --> Recon
+    Cron --> J5 --> SBA
+    Cron --> J6 --> Onb
+    J6 --> Led
+    J6 --> Id
+
+    classDef infra fill:#fed7aa,stroke:#9a3412,color:#111
+    classDef job fill:#fef3c7,stroke:#92400e,color:#111
+    classDef svc fill:#dcfce7,stroke:#166534,color:#111
+    classDef acl fill:#e9d5ff,stroke:#6b21a8,color:#111,stroke-width:2px
+```
+
+**Idempotency reminder:** every scheduled job is idempotent on its natural key — `(account_id, date)` for accrual, `(account_id, yyyy-mm)` for capitalisation, `(source, business_date)` for recon. Re-running is safe. See the Scheduled Job Catalog section below for schedules, duration budgets, and failure handling per job.
+
+---
+
+### Diagram 5 — External boundary (Sponsor-Bank Adapter detail)
+
+Answers "**how does Velo's world connect to the sponsor's world?**" This is the anti-corruption layer close-up.
+
+```mermaid
+flowchart LR
+    subgraph Velo["Velo internal"]
+      direction TB
+      PIn[Payments-In]:::svc
+      PS[PayID]:::svc
+      Recon[Reconciliation]:::svc
+      SFTPJob[SFTP puller job]:::job
+      WH[Webhook Receiver]:::ing
+    end
+
+    SBA[Sponsor-Bank Adapter<br/><i>the only place sponsor SDK / SFTP client lives</i>]:::acl
+    S3In[(S3 inbound-files<br/>raw sponsor artefacts)]:::data
+    SqsFiles[/SQS<br/>file-arrived/]:::data
+
+    subgraph Sponsor["Sponsor Bank"]
+      direction TB
+      SP_SFTP[[SFTP server<br/>DE files + statements]]:::ext
+      SP_REST[[REST APIs<br/>PayID mgmt · outbound roadmap]]:::ext
+      SP_WH_OUT[NPP outbound webhook client<br/>mTLS + HMAC]:::ext
+    end
+
+    %% Real-time NPP: sponsor → Velo
+    SP_WH_OUT ==> WH
+    WH --> PIn
+
+    %% Real-time REST: Velo → sponsor (PayID mgmt, recon queries)
+    PS --> SBA
+    Recon --> SBA
+    PIn --> SBA
+    SBA <==> SP_REST
+
+    %% Batch: sponsor SFTP → Velo
+    SFTPJob <-. SFTP over VPN .-> SP_SFTP
+    SFTPJob --> S3In
+    S3In -.->|S3 event| SqsFiles
+    SqsFiles --> PIn
+    SqsFiles --> Recon
+
+    classDef svc fill:#dcfce7,stroke:#166534,color:#111
+    classDef ing fill:#bfdbfe,stroke:#1e3a8a,color:#111
+    classDef acl fill:#e9d5ff,stroke:#6b21a8,color:#111,stroke-width:2px
+    classDef data fill:#fef3c7,stroke:#92400e,color:#111
+    classDef job fill:#fff7ed,stroke:#9a3412,color:#111
+    classDef ext fill:#e5e7eb,stroke:#374151,color:#111
+```
+
+**Three integration surfaces with the sponsor**, all funnelled through Velo-owned components:
+
+| Direction | Mechanism | Velo endpoint | What flows |
+|---|---|---|---|
+| Sponsor → Velo (real-time) | mTLS + HMAC webhook | **Webhook Receiver** | Inbound NPP messages (`pacs.008`) |
+| Sponsor → Velo (batch) | SFTP over VPN, PGP-signed | **SFTP puller job** → S3 → SQS → Payments-In / Recon | DE files, EOD statements, position reports |
+| Velo → Sponsor (real-time) | REST + mTLS | **Sponsor-Bank Adapter** | PayID registration, ad-hoc queries, outbound NPP (roadmap), outbound DE (roadmap) |
+
+If the sponsor is swapped tomorrow (say from Cuscal to Indue), the only code that changes is inside the **Sponsor-Bank Adapter** module — every other service continues to work unmodified.
 
 ---
 
@@ -227,37 +398,15 @@ Any code path that mutates money or state ultimately traces back to one of these
 
 ---
 
-## Internal API map (who calls whom, synchronously)
+## Sync-call rules of thumb
 
-Solid arrow = HTTP/gRPC (in the split future) / function call (today). Dotted = event.
+The exact who-calls-whom picture is in **Diagram 2** above. The invariants worth memorising:
 
-```mermaid
-flowchart LR
-    Onb --> Acc
-    Onb --> Id
-    Tx  --> Acc
-    Tx  --> Led
-    Tx  --> Fraud
-    PIn --> Acc
-    PIn --> Led
-    PIn --> SBA
-    PSvc --> SBA
-    Int --> Led
-    Recon --> Led
-    Recon --> SBA
-    Notif -.-> KafkaTopic
-    Fraud -.-> KafkaTopic
-    OpsAPI --> Onb
-    OpsAPI --> Acc
-    OpsAPI --> Led
-    OpsAPI --> Recon
-```
-
-**Sync-call rules of thumb:**
-- **Only three services call `Ledger`**: Transfers, Payments-In, Interest. Nobody else writes money.
-- **Only two services call `Sponsor-Bank Adapter`**: Payments-In (webhook flow, statement pulls) and PayID (registration). All external side effects are contained.
-- **`Account.resolveByBSBAcct`** is the hottest read path (called on every inbound payment). Cached in Redis with a short TTL and invalidated on account state changes via a Kafka subscriber.
-- **`Notifications`** and **`Fraud`** are pure event consumers. They never receive sync calls from other domain services.
+- **Only three services call `Ledger`**: Transfers, Payments-In, Interest. Anyone else touching money is a bug.
+- **Only three services call `Sponsor-Bank Adapter`**: Payments-In (statement pulls + roadmap outbound), PayID (registration), Reconciliation (position queries). All external side effects are contained in one adapter.
+- **`Account.resolveByBSBAcct`** is the hottest read path (called on every inbound payment). Cached in Redis with a 5-minute TTL and invalidated on `account.frozen/unfrozen/closed` events via a Kafka subscriber.
+- **`Notifications`** and **(roadmap) `Fraud`** are pure event consumers. They never receive sync calls from other domain services.
+- **Ops Portal API** is the only ingress with read access to `Ledger` — no other ingress reads the ledger directly; customer balance/history goes through `Account` (which fronts the balance projection).
 
 ---
 
