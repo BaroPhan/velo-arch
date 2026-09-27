@@ -58,6 +58,7 @@ Read in order. Each doc is self-contained and reflects one of the bullets in the
 | 4 | [`docs/workflows/`](docs/workflows/) | **Per-requirement workflow docs**, each with (a) a sample case, (b) a sequence diagram covering Customer ↔ Velo ↔ Sponsor Bank ↔ Australian scheme, (c) an ERD delta showing the models it touches, (d) how our services interact at the cloud level. |
 | 5 | [`docs/05-erd-consolidated.md`](docs/05-erd-consolidated.md) | **Consolidated first-cut ERD** (Mermaid) with every entity, key attributes, and relationships. This is the ERD you attach to the email. |
 | 6 | [`docs/06-cloud-architecture.md`](docs/06-cloud-architecture.md) | **High-level architecture diagram** (Mermaid) plus a service-by-service breakdown, external integrations, VPC / network posture, CI/CD, and testing strategy. This is the architecture diagram you attach to the email. |
+| 7 | [`docs/07-explainers.md`](docs/07-explainers.md) | **Background glossary** — Australian payment rails (BSB, PayID, NPP, DE), FCS + what "auditable" really means, RADI vs Full ADI, double-entry / sub-ledger / idempotency / exactly-once explained with worked examples, trade-offs compared in tables, PII + data residency, TLS/KMS/MFA/WAF/SoD explained, **Velo vs ZaloPay/MoMo (Vietnam e-wallets)**, and how the sponsor bank actually plugs in. Read this first if any AU-banking term in the other docs is unfamiliar. |
 
 ### Workflow docs (one per MVP requirement)
 
