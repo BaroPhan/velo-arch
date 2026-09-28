@@ -78,7 +78,7 @@ Read in order. Each doc is self-contained and reflects one of the bullets in the
 ## 4. How to use this pack
 
 1. Skim `docs/01-product-and-business.md` and `docs/03-mvp-requirements.md` to lock in scope in your head.
-2. Read the five workflow docs — each one seeds the sequence diagram you might use for deliverable #3. Pick one to elevate into your submission (recommendation: **inbound NPP/PayID** — it exercises the sponsor bank boundary, the async settlement callback, and the fraud/AML hooks).
+2. Read the five workflow docs — each one seeds the sequence diagram you might use for deliverable #3. Pick one to elevate into your submission (recommendation: **inbound NPP/PayID** — it exercises the sponsor bank boundary, the async settlement callback, and the fraud/AML hooks). Attach [`docs/exports/npp-inbound-sequence.png`](docs/exports/npp-inbound-sequence.png).
 3. Attach `docs/exports/velo-erd.svg` (or the PNG next to it) as the ERD. The source is `docs/05-erd-consolidated.md`.
 4. Use Diagram 2 in `docs/09-internal-system-architecture.md` as the architecture diagram you export for the email. Use `docs/06-cloud-architecture.md` if the panel asks for the AWS placement (region, edge, DR).
 5. Bring `docs/02-baseline-and-core-scope.md` mentally into the interview — it maps every "we accepted this / we deferred this" trade-off to a founder concern.

@@ -148,11 +148,12 @@ flowchart TB
       SP1([Sponsor Bank<br/>sends NPP webhook +<br/>drops SFTP files]):::ext
     end
 
-    %% ─── Row 2: Ingress ───
-    subgraph Ingress["Ingress  (3 API surfaces)"]
+    %% ─── Row 2: Identity provider + Ingress ───
+    subgraph Edge["Sign-in + ingress"]
       direction LR
-      CAPI[Customer API]:::ing
-      OAPI[Ops API]:::ing
+      Cog([Cognito<br/>customer pool + ops pool<br/>password · MFA · JWT]):::ext
+      CAPI[Customer API<br/>JWT]:::ing
+      OAPI[Ops API<br/>JWT]:::ing
       WHR[Webhook Receiver]:::ing
     end
 
@@ -219,9 +220,12 @@ flowchart TB
 
     %% ═══ ~22 arrows, all forward — no back-arrows ═══
 
-    %% Row 1 → Row 2 : client → ingress (3)
-    CA --> CAPI
-    OW --> OAPI
+    %% Row 1 → Row 2 : sign-in, then API. Sponsor does not use Cognito.
+    CA -->|sign-in + MFA| Cog
+    OW -->|sign-in + hardware key| Cog
+    CA -->|Bearer JWT| CAPI
+    OW -->|Bearer JWT| OAPI
+    Id -->|verify JWT via JWKS<br/>step-up MFA| Cog
     SP1 ==>|mTLS + HMAC| WHR
 
     %% Row 2 → Row 3 : ingress → domain (3 group-level, not 11 individual)
@@ -277,7 +281,7 @@ flowchart TB
 > The diagram uses **ELK layout** (not Mermaid's default Dagre) for a cleaner routing of the multi-way arrows.
 
 **Reading this diagram top-to-bottom:**
-1. **Rows 1–2** — Clients enter through one of the 3 API surfaces. Sponsor Bank (`SP1`) enters via the Webhook Receiver.
+1. **Rows 1–2** — The customer app and the ops portal sign in to **Cognito** (separate user pools). Cognito owns the password and MFA; the app then calls Customer API or Ops API with the JWT. **Identity** checks that JWT against Cognito's JWKS and asks Cognito for step-up on sensitive actions. Velo stores only `cognito_sub`. Sponsor Bank (`SP1`) does not use Cognito; it enters via the Webhook Receiver with mTLS + HMAC.
 2. **Row 3** — Domain services on the left (grouped by role, 10 modules), Anti-Corruption Layer on the right — the *only* module that talks to the sponsor (`SP2`).
 3. **Row 4** — State. Every domain service writes into its own Postgres schema **and**, in the same transaction, an `outbox_event` row. Money-movement services also cache in Redis; Onboarding writes uploaded ID docs to S3-KYC.
 4. **Rows 5–6** — Async event backbone. Debezium's publication is **`outbox_event` only** — it does not publish `transaction`, `posting`, `ledger_account`, or any other business table. Kafka then fans out to (a) the audit-lake mirror and (b) Notifications → per-channel SQS → external providers.

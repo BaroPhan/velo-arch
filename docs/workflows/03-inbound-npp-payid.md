@@ -27,6 +27,8 @@ Velo is not a direct NPP participant; the **sponsor bank is the NPP participant*
 
 ## Sequence diagram
 
+Rendered copy for the submission email: [`docs/exports/npp-inbound-sequence.png`](../exports/npp-inbound-sequence.png).
+
 ```mermaid
 sequenceDiagram
     autonumber
