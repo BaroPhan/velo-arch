@@ -903,13 +903,494 @@ If any diverge: bug in the daily accrual calc or in the rate-version selection.
 
 ---
 
+---
+
+## Second-round follow-ups (Q22–Q30)
+
+### Q22. `RECON_BREAK` uses columns for 4-eyes; `APPLICATION_DECISION` uses a child table. Why different?
+
+Two legitimate patterns; we picked different ones for different workflows.
+
+**Pattern A — child table with row-per-decision** (`APPLICATION_DECISION`)
+- Parent row (`APPLICATION`) has many child decision rows.
+- Each decision is its own row with `is_confirmation`, `reviewer_ops_user_id`, `notes`, `decided_at`.
+- **Good for:** multi-step workflows (RFI → resubmit → re-review → APPROVE → confirm), where a single application can accumulate many decisions over time, some of which are proposals that later get overridden.
+
+**Pattern B — columns on the parent** (current `RECON_BREAK`)
+- One row for the break, with columns `proposed_by_ops_user_id`, `confirmed_by_ops_user_id`, `resolution_action`, `resolved_at`.
+- **Good for:** simple two-step workflows (propose → confirm → done) with no need for history of rejected proposals.
+
+**Why we split them:**
+- Onboarding genuinely has multi-step decisions (RFI is common; each RFI cycle produces its own decision rows). Child table is a better fit.
+- Recon breaks are typically resolve-or-escalate. Rejected proposals are rare. Columns on the parent are simpler.
+
+**But — honest reflection:** if the panel asks about consistency, the *correct* long-term answer is to standardise on Pattern A everywhere. Uniform pattern = fewer surprises for new engineers, easier to audit ("look for four-eyes evidence in the `*_DECISION` child table"), and future-proof for when a workflow you thought was simple turns out to need multi-step history.
+
+**Suggested refactor** (post-MVP):
+```mermaid
+erDiagram
+    RECON_BREAK ||--o{ RECON_BREAK_DECISION : "has"
+
+    RECON_BREAK_DECISION {
+        uuid id PK
+        uuid recon_break_id FK
+        string action "PROPOSE_ADJUSTMENT|CONFIRM_ADJUSTMENT|ESCALATE|NO_ACTION"
+        string reason_code
+        text notes
+        uuid reviewer_ops_user_id FK
+        boolean is_confirmation
+        timestamp decided_at
+    }
+```
+
+Same pattern reused across `APPLICATION`, `RECON_BREAK`, `ACCOUNT_HOLD`, `RATE_CHANGE`, `REVERSAL_REQUEST`, etc.
+
+For the interview: name the trade-off explicitly. "We shipped RECON_BREAK with Pattern B for MVP simplicity, but the strategic answer is Pattern A everywhere. We'd refactor in Sprint 2 before we build a second 4-eyes workflow."
+
+---
+
+### Q23. Does `PAYMENT_INSTRUCTION` have its own idempotency? What happens if we replay a whole file that's already produced transactions?
+
+Yes — idempotency is defence-in-depth across **three independent levels**, each with its own unique key and its own DB constraint. Losing any one level is safe because the next level catches duplicates.
+
+| Level | Entity | Unique key | Prevents |
+|---|---|---|---|
+| 1 | `INBOUND_FILE` | `sponsor_file_id` | Same file re-ingested end-to-end |
+| 2 | `PAYMENT_INSTRUCTION` | `(inbound_file_id, record_seq)` for DE; `sponsor_msg_id` for NPP | Partial re-ingest of a file (crash mid-way, restart from record 0) |
+| 3 | `TRANSACTION` | `idempotency_key = "DE|<file_id>|<seq>|<amount>"` (deterministic) | Double posting to the ledger itself |
+
+**Scenario: sponsor sends the same file twice.**
+
+```
+1. First file arrives, SFTP puller downloads → INSERT INTO inbound_file (sponsor_file_id='F123', ...) → OK.
+2. Payments-In parses; for each record, INSERT INTO payment_instruction (file_id, seq=N, ...) → OK.
+3. For each PI, call Ledger.post(idempotency_key="DE|F123|N|amt") → OK.
+4. Second copy of the same file arrives.
+5. SFTP puller tries INSERT INTO inbound_file (sponsor_file_id='F123', ...) → UNIQUE VIOLATION.
+6. Puller logs 'duplicate file, skipping' → no parsing, no PIs, no ledger touch.
+```
+
+The file is deduped at level 1. Nothing else runs. Zero double-posts.
+
+**Scenario: crash halfway through processing a file.**
+
+```
+1. File F123 has 100 records. We've inserted PIs for records 0–47 and Ledger transactions for records 0–39.
+2. Payments-In crashes at record 48.
+3. Restart. SFTP puller: file already known, skip. But Payments-In needs to resume.
+4. We re-invoke the parser (from `INBOUND_FILE.status='PARSED'` but not yet 'POSTED').
+5. For record 0: INSERT INTO payment_instruction → UNIQUE VIOLATION (already exists) → skip.
+6. Same for records 1–47 → all deduped at level 2.
+7. Records 48–99: new inserts → OK. Ledger posts them.
+```
+
+Level 2 dedup makes restart safe.
+
+**Scenario: the message crashed BETWEEN PI insert and ledger post.**
+
+```
+1. PI for record 42 inserted.
+2. Ledger.post fails (DB blip).
+3. On retry, PI exists (skip level 2) but ledger transaction doesn't.
+4. Payments-In has a reconciliation step: for each PI with status != 'POSTED', invoke Ledger.
+5. Ledger.post with idempotency_key="DE|F123|42|amt" → new insert → OK.
+```
+
+Level 3 catches this.
+
+**Scenario: we WANT to replay because we fixed a parser bug.**
+
+This is an Ops-controlled path (with four-eyes):
+
+1. Ops uploads the raw file to a **dry-run parser** in staging that doesn't touch prod DB → verify the new parser is correct.
+2. In prod, Ops issues a "reprocess file" action:
+   - DELETE the affected `PAYMENT_INSTRUCTION` rows (four-eyes required; audit-logged).
+   - Note: DELETING PIs does **not** delete the ledger transactions (they're immutable).
+3. Ledger transactions from the buggy run are **REVERSED** (not deleted) via ops action.
+4. Re-run the parser. New PIs generated. Ledger.post called with new idempotency keys — **the keys must differ** from the buggy run, e.g. by suffixing a version (`"DE|F123|42|amt|v2"`).
+5. Old (reversed) transactions + new (correct) transactions both exist in history for audit.
+
+**The key insight:** idempotency keys are DETERMINISTIC and MEANING-BEARING. If you want a "different meaning" (a corrected version), the key must be different. Never re-use a key across semantically different operations.
+
+---
+
+### Q24. When is `SPONSOR_POOL` credited instead of debited? Why DR = + and CR = − in reconciliation? Can we flip it?
+
+**`SPONSOR_POOL` is an ASSET** (money we have with the sponsor). Assets are naturally DR — they go up on DR, down on CR.
+
+**Cases where `SPONSOR_POOL` is CR (goes down):**
+
+| Event | Postings | MVP? |
+|---|---|---|
+| **Outbound payment** (customer sends money to external bank) | DR customer $100 · CR SPONSOR_POOL $100 | Roadmap |
+| **Return of inbound credit** (mistaken payment sent back) | DR customer $100 · CR SPONSOR_POOL $100 | Roadmap |
+| **Sponsor deducts scheme fees** from our pool | DR SCHEME_FEES_EXPENSE $50 · CR SPONSOR_POOL $50 | Post-MVP |
+| **Sponsor deducts monthly service charges** | DR SPONSOR_FEES_EXPENSE $500 · CR SPONSOR_POOL $500 | Post-MVP |
+| **We move funds to a second sponsor** (multi-sponsor future) | DR SPONSOR_POOL_B · CR SPONSOR_POOL_A | Post-MVP |
+
+**In MVP:** `SPONSOR_POOL` is basically **only DR'd** because we only support **inbound** flows + internal transfers (which don't touch the pool at all). Once outbound payments ship, CR becomes routine.
+
+**Why "DR = + and CR = −" for the sponsor pool specifically?**
+
+Because it's an asset. The sign depends on the **account class**, not a global rule:
+
+| Account class | Natural balance side | DR effect | CR effect |
+|---|---|---|---|
+| **Asset** (`SPONSOR_POOL`, `Cash at RBA`, `Receivables`) | DR | +$X (increase) | −$X (decrease) |
+| **Liability** (`Customer Deposits`, `Payables`, `Deferred Revenue`) | CR | −$X | +$X |
+| **Equity** (`Retained Earnings`, `Share Capital`) | CR | −$X | +$X |
+| **Revenue** (`Interest Income`, `Fee Income`) | CR | −$X | +$X |
+| **Expense** (`Interest Expense to Customer`, `Sponsor Fees`) | DR | +$X | −$X |
+
+So a single transaction with 2 postings — DR one, CR the other — moves each account in a direction that matches its class. Look at the interest payment:
+```
+DR Interest Expense (expense, natural DR) → expense increases
+CR Customer Deposit (liability, natural CR) → customer's balance increases
+```
+Both sides "increase" from the account's own perspective, but recorded on opposite T-account sides. That's what "double-entry" means.
+
+**Can we flip the convention (DR = − and CR = +)?**
+
+Mathematically, yes. Practically, **no**, for three reasons:
+
+1. **Auditors will hate you.** Every accounting textbook, every audit tool, every SAF-T/XBRL export uses the traditional convention. Flipping it means every third-party integration needs a translation layer.
+2. **Every accountant you hire knows the classical rules.** Onboarding cost is huge.
+3. **Standards + regulations** (Australian Accounting Standards, IFRS) presume the classical convention.
+
+**Alternative — signed amounts** (used by TigerBeetle and similar purpose-built ledger databases):
+
+```
+Every posting has a signed amount in the account's natural direction.
+balance = SUM(amount) per account.
+No dr_cr column at all.
+```
+
+This is simpler and less error-prone in code, but requires a translation layer whenever you export to external systems. Some teams do this internally and translate at the export boundary. We chose classical DR/CR because our audit trail goes straight to APRA/auditors without intermediation.
+
+---
+
+### Q25. If BOTH sides exhaust exponential-backoff retries, whose problem is it? How do we determine the source?
+
+**Ownership depends on WHICH side failed.**
+
+- Failure on **our side** (Postgres down, Payments-In crash, network problem outbound from us) → **our problem**. The customer's money is stuck in the sponsor pool with no ledger entry. We owe them.
+- Failure on **sponsor side** (their retry code is wrong, sponsor's system is down) → **their problem** contractually, but we still have to help resolve because our customer is affected.
+- **Unclear / middle** → shared investigation.
+
+**What we do about the customer's money in the meantime:**
+
+The money did settle on RBA rails (that's how the NPP/DE mechanics work) → it's physically in the sponsor's pool. Our ledger just doesn't reflect it yet. The daily reconciliation will detect the discrepancy and post it (or trigger a corrective process).
+
+**How to determine the source of the failure:**
+
+Layered logging + shared correlation IDs:
+
+**Our logs capture:**
+- `sponsor_msg_id` (their identifier — the shared correlation ID)
+- HTTP request received (headers, body hash — not full body for PII)
+- Time received (`X-Sponsor-Timestamp` and our server time)
+- Processing steps (`sig verified` → `account resolved` → `ledger call` → response)
+- Every failure with stack trace + DB state snapshot
+- HTTP response we returned (200/503/etc.)
+
+**Sponsor logs capture** (they own this — via their support portal or a joint escalation channel):
+- `sponsor_msg_id`
+- HTTP request they sent us (URL + timestamp)
+- HTTP response they got from us (or "timeout")
+- Retry attempts (timestamps of each)
+- Final outcome (accepted, rejected, given up)
+
+**Diagnostic decision tree** using `sponsor_msg_id` as the correlation key:
+
+```
+Query our logs for sponsor_msg_id:
+├─ No logs found at all
+│   → Request never reached us.
+│   → Check ALB access logs / WAF logs / CloudFront logs.
+│   → If nothing there either → network/DNS problem or sponsor didn't send.
+│
+├─ Logs show HTTP 200 responses
+│   → We processed. Ledger transaction exists.
+│   → Sponsor's 5xx-detection was buggy, OR they didn't get our response due to their side.
+│   → SPONSOR's problem.
+│
+├─ Logs show HTTP 503 responses (repeated)
+│   → We consistently failed. Postgres/ledger was down.
+│   → OUR problem.
+│
+├─ Logs show HTTP 401/403 
+│   → Signature check failed. Key rotation drift?
+│   → SHARED problem (key coordination).
+│
+└─ Logs show partial processing (crashed mid-flow)
+    → Look at our exception. Retry via our replay queue.
+    → OUR problem.
+```
+
+**Prevention:**
+- Long retry windows on the sponsor side (24–48h) to survive extended outages.
+- Manual escalation channel — sponsor's ops calls our ops with the `sponsor_msg_id` when their retries give up.
+- Daily reconciliation catches everything not resolved within 24h.
+
+**Recovery:**
+- If we identify a message that never landed: sponsor can re-send it (or we manually inject via an ops tool that bypasses the webhook but goes through the same idempotency-safe path).
+- If we processed but sponsor didn't get our success: sponsor accepts our word after we show them the ledger transaction ID + timestamps.
+
+**Contractual side:**
+- The sponsor agreement includes SLAs on both sides (uptime, response time, retry policy).
+- Financial responsibility for stuck funds is usually contractually assigned to whichever side failed the SLA.
+- APRA notification is required if customer funds are unavailable beyond a defined threshold.
+
+---
+
+### Q26. Do `INBOUND_FILE` / `INBOUND_MESSAGE` and `PAYMENT_INSTRUCTION` share an idempotency key and the same status flow?
+
+**No** — they share the same *lineage* (parent → child), but they have **different keys** and **different status vocabularies**, because they answer different questions.
+
+**Different keys** (see Q23):
+
+| Entity | Idempotency key | Semantic |
+|---|---|---|
+| INBOUND_FILE | `sponsor_file_id` | "Has the sponsor sent me this file before?" |
+| INBOUND_MESSAGE | `sponsor_msg_id` | "Has the sponsor sent me this webhook before?" |
+| PAYMENT_INSTRUCTION | `(file_id, seq)` or `sponsor_msg_id` | "Have I already parsed this record from this file?" |
+| TRANSACTION | `deterministic hash` | "Have I already posted this to the ledger?" |
+
+**Different status vocabularies:**
+
+`INBOUND_FILE.status`:
+- `RECEIVED` — SFTP puller downloaded + PGP verified.
+- `PARSED` — parser extracted all records into PIs.
+- `POSTED` — every contained PI is in a terminal state (POSTED/UNMATCHED/REJECTED/RETURNED).
+- `QUARANTINED` — parse failed or content invalid; not processed at all.
+
+`INBOUND_MESSAGE.status`:
+- `RECEIVED` — webhook arrived, signature verified, persisted.
+- `POSTED` — ledger has a transaction for it.
+- `REJECTED` — accepted the webhook (200 to sponsor) but couldn't post (account frozen, invalid recipient, etc.) — sponsor was told via 200 with `{accept: false, reject_code}`.
+- `REPLAY_QUEUED` — we returned 503 due to a downstream issue; sitting in DLQ.
+
+`PAYMENT_INSTRUCTION.status`:
+- `RECEIVED` — parsed from file/message.
+- `MATCHED` — account resolved to a Velo customer.
+- `POSTED` — ledger transaction created.
+- `UNMATCHED` — account not found (typo, closed account, wrong BSB).
+- `REJECTED` — resolved to a customer but business rules said no (RADI cap, frozen).
+- `RETURNED` — sent back to sponsor for return-to-remitter (roadmap).
+
+**Why not one shared status?** They live at different granularity:
+
+- A file is `POSTED` **only when** all its records reach terminal status. It's an aggregate.
+- A PI is `POSTED` when **its own** transaction is written.
+- Losing this distinction hurts observability: you can't easily answer "which files are stuck?" if you only have per-PI status.
+
+**Relationship in practice:**
+
+```sql
+-- File is fully processed when no non-terminal PIs remain:
+UPDATE inbound_file SET status = 'POSTED'
+WHERE id = :file_id
+  AND NOT EXISTS (
+    SELECT 1 FROM payment_instruction
+    WHERE inbound_file_id = :file_id
+      AND status NOT IN ('POSTED','UNMATCHED','REJECTED','RETURNED')
+  );
+```
+
+So they're linked via aggregate rollup, not via shared vocabulary.
+
+---
+
+### Q27. Should inbound file/message rows also store `sig_algo` + the signature itself? If keys rotate quarterly, how do we verify old signatures years later?
+
+**Yes — both `sig_algo` and the raw `sig_value` should be stored** for full audit reproducibility. The current schema shows only `sig_verified` boolean, which is insufficient for cryptographic forensics.
+
+**Refined schema (recommended change to `INBOUND_MESSAGE` and `INBOUND_FILE`):**
+
+| Field | Purpose |
+|---|---|
+| `raw_payload` (JSONB / BYTEA) | The bytes as received. Never modified. |
+| `sig_algo` (string) | e.g. `HMAC-SHA256`, `RSA-SHA256`, `ED25519`, `JWS-HS256` |
+| `sig_value` (bytea or base64) | The signature bytes themselves |
+| `sig_key_id` (string) | Identifier of the key used, e.g. `sponsor-hmac-2026-q3` |
+| `sig_version` (string) | Version of the canonical signing-string format, e.g. `v1` |
+| `sig_verified` (bool) | Result of verification at ingest time |
+| `sig_verified_at` (timestamp) | When we verified |
+| `sig_verified_by_key_id` (string) | Which key we verified against (should match `sig_key_id`; useful during rotation transition) |
+
+Consistent naming across both `INBOUND_FILE` and `INBOUND_MESSAGE`.
+
+**Key rotation — how to verify old signatures:**
+
+The critical rule: **retire keys, never delete them**. Every key that has ever been used to sign a message must remain available for verification for as long as we retain the messages (7 years for AUSTRAC).
+
+**Key registry design:**
+
+```
+SPONSOR_SIGNING_KEY
+  key_id (PK)              e.g. "sponsor-hmac-2026-q3"
+  algo                     e.g. "HMAC-SHA256"
+  material_encrypted       encrypted with a KMS-CMK; may be a HMAC key, RSA public key, etc.
+  status                   ACTIVE|RETIRED (verify-only) | DESTROYED (never!)
+  activated_at
+  retired_at
+  version                  the signing-string canonical version this key uses
+```
+
+**Rotation lifecycle:**
+1. Sponsor issues a new key `sponsor-hmac-2026-q4`, marks it ACTIVE from Nov 1.
+2. Old key `sponsor-hmac-2026-q3` stays ACTIVE until sponsor stops signing with it (some overlap for zero-downtime cutover).
+3. Once sponsor confirms cutover, old key transitions to RETIRED (verify-only).
+4. All old messages still have `sig_key_id = "sponsor-hmac-2026-q3"`. Verification looks up the key by ID, retrieves the material, verifies.
+5. Retention: keep RETIRED keys until every record signed with them is past retention (7 years + a buffer).
+
+**Canonical signing string versioning:**
+
+The signing string is not just the payload — it's a canonical construction like:
+```
+signing_string_v1 = f"{HTTP_METHOD}\n{path}\n{X-Sponsor-Timestamp}\n{sha256(body_bytes)}"
+signature = HMAC-SHA256(key, signing_string_v1)
+```
+
+If the format ever changes (say, we add `X-Sponsor-Request-Id` to the canonicalisation), that becomes v2. Every stored record has `sig_version` so we know which canonicaliser to use for re-verification.
+
+**Practical operating model:**
+- Verify at ingest — 99.9% of records never need re-verification.
+- For legal challenges or audit sampling, we run a re-verification job using the stored `sig_key_id` + `sig_algo` + `sig_version` and expect all "trusted" records to still verify.
+- If re-verification fails on a stored `sig_verified=true` record, we have a real problem (either key material corrupted or the ingest-time verifier was buggy) — investigate immediately.
+
+**Doc correction:** update `INBOUND_MESSAGE` and `INBOUND_FILE` schemas in `docs/05-erd-consolidated.md` and both workflow docs (02, 03) to add `sig_algo`, `sig_value`, `sig_key_id`, `sig_version` fields.
+
+---
+
+### Q28. Recon C is aggregate only — does it also check per-account `available_balance == SUM(postings)`?
+
+Correct — recon C (the "sponsor pool == sum of customer + control accounts" check) is **aggregate only**. Per-account projection consistency is a **separate check** that also runs daily.
+
+The three-check reconciliation suite:
+
+| # | Check | Compares | What it catches |
+|---|---|---|---|
+| A | **External per-day movements** | `SUM(Velo postings to SPONSOR_POOL today)` vs `sponsor statement daily totals` | Missing / extra ingested payments for that day |
+| B | **External balance** | `SPONSOR_POOL.available_balance` vs `sponsor's Velo Pool balance` | Cumulative drift from any past day |
+| C | **Internal aggregate identity** | `SPONSOR_POOL balance` vs `SUM(CUSTOMER + HOLD balances) − INTEREST_EXPENSE + other GL adjustments` | Broken double-entry writes at the aggregate level |
+| D | **Per-account projection sanity** ✅ | For each ledger_account: `available_balance_cents == recompute from postings` | Race condition or bug that updated the projection without matching postings (or vice versa) |
+
+D is called the "balance projection sanity check" in `docs/09-internal-system-architecture.md` — it runs at 05:00 AEST daily.
+
+**Why D is separate from C:**
+
+- **C** catches misdeposits between account classes (money "leaked" out of the balance sheet identity). It's an aggregate.
+- **D** catches per-account inconsistencies where the aggregate might still balance. Example: bug credits Alice $100 in the balance projection but only inserts $95 of postings, and simultaneously debits Bob $5 more in postings than in the projection. Aggregate sum matches; **individual balances are wrong**. Only D catches this.
+
+**Cost of D:**
+
+`SELECT account_id, SUM(...) FROM postings GROUP BY account_id` — O(N postings). At MVP scale (100k accounts, ~100 postings each = 10M rows), this runs in seconds against a Postgres read replica. At 10M accounts, we'd batch it (10 shards of 1M accounts each) or maintain a materialised "daily EOD balance" table maintained by the outbox pipeline.
+
+**On mismatch:**
+1. P1 alert to on-call.
+2. Optionally freeze writes to that account (or all if systemic).
+3. Ledger truth (postings) wins — repair the projection: `UPDATE ledger_account SET available_balance_cents = <recomputed>`. Never repair the postings; they're truth.
+4. Post-mortem for the code path that caused the drift.
+
+**Doc correction:** state explicitly in `docs/workflows/02-inbound-direct-entry.md` and `docs/workflows/05-interest-accrual.md` that the daily reconciliation is a suite of four checks (A, B, C, D), not three.
+
+---
+
+### Q29. Why use the outbox pattern when we could just CDC directly on `TRANSACTION` / `LEDGER_ACCOUNT`?
+
+**Because outbox events and row changes are not the same thing** — and conflating them causes downstream consumers to break every time you touch the business schema.
+
+**The two patterns:**
+
+| Aspect | Outbox pattern (our choice) | Direct CDC on business tables |
+|---|---|---|
+| **Event schema** | You design it — versioned, stable, explicit | Auto-derived from row shape; changes when you change the table |
+| **Multiple events per transaction** | Insert N outbox rows in the same txn | 1 row change → 1 CDC event; can't easily emit multiple semantic events |
+| **Filtering** | Only publish events you care about | Every row change is emitted; consumer has to filter |
+| **Rich payload** | Include computed fields, joined context, business-language field names | Just column values; consumers reassemble context |
+| **Event ordering** | Explicit via `outbox_event.created_at` in commit order | Log position; correct but harder to reason about |
+| **Refactor safety** | Rename `transaction.status` → outbox events unchanged | Rename → downstream contracts break |
+| **Extra writes** | One extra INSERT per event | Zero |
+| **CDC target** | Small, focused outbox table | Every business table |
+
+**Concrete example — `customer.onboarded` event:**
+
+- Consumers care about a coherent event: customer_id, application_id, approved_at, first_account_id, kyc_reviewer_ids, etc.
+- Direct CDC on `customer` would fire on `UPDATE customer SET kyc_status='VERIFIED'`. But the "onboarded" event needs the newly-created `account.id` too — which comes from a different table update in a slightly later transaction.
+- With outbox, the Onboarding service, at the moment it decides "this customer is truly onboarded", writes ONE outbox row with the full coherent payload. Downstream doesn't have to join.
+
+**Concrete example — `interest.capitalised.month_closed`:**
+
+- This is a summary event covering thousands of `TRANSACTION` inserts (one capitalisation per account for the month).
+- No single row change corresponds to "the month closed" — it's a computed event.
+- With outbox: Interest Service inserts one row when the job finishes.
+- With direct CDC: consumers would have to detect "no more capitalisation transactions incoming" — much harder.
+
+**What CDC IS used for in our design:**
+
+CDC (Debezium) does tail the `outbox_event` table itself and publish to Kafka. That's the well-known **Outbox + CDC** combined pattern. We get:
+- Transactional guarantee (outbox row committed atomically with business write).
+- No dual-write risk.
+- Async publish to Kafka.
+
+We just don't put CDC directly on `transaction` / `posting` / `ledger_account`.
+
+**Small note on hybrid designs:** some teams use direct CDC on business tables for **internal replicas** (e.g. building a search index, or materialising a read-model into Elasticsearch) where the coupling to schema is acceptable. And outbox for **domain events** crossing bounded contexts. That's a legitimate combination — we could adopt it later if we build heavy read-models.
+
+**One-line summary:** outbox is a semantic API for events; direct CDC is a byte-level shadow of the database. We publish the former, not the latter.
+
+---
+
+### Q30. Do we do double-entry + reconciliation because we're a RADI, or is it a universal ADI (or banking) requirement?
+
+**Universal.** Every ADI, every bank, every credit union, every neobank, every RADI, every Big Four — everywhere in the world — uses double-entry bookkeeping and reconciliation. The requirement predates the banking industry (invented in Venice, 1494) and is enshrined in every accounting standard.
+
+**Broken down by requirement:**
+
+| Requirement | Applies to | Notes |
+|---|---|---|
+| **Double-entry bookkeeping** | Everyone that has to publish financial statements | Australian Accounting Standards (based on IFRS) mandates it. RADI status irrelevant. |
+| **Reconciliation with settlement counterparties** | Every bank | Big Four reconcile with RBA (their ES account), card schemes (Visa/MC), correspondent banks (SWIFT). RADIs reconcile with their sponsor. Same discipline, different counterparty. |
+| **Single Customer View for FCS** | Every ADI (RADI + full) | APRA CPS 910. |
+| **Regulatory reporting (EFS returns, ARF forms)** | Every ADI | Frequency and depth scale with size, but the schema is universal. |
+| **AUSTRAC AML/CTF program + retention** | Every reporting entity | Includes ADIs, e-wallets, remitters, casinos, etc. |
+| **APRA CPS 234 (info security)** | Every APRA-regulated entity | RADIs get the same standard, sometimes scaled. |
+| **Prudential capital ratios** | Every ADI | Full ADIs meet full requirements; RADIs meet a scaled version. |
+
+**What IS specific to RADI:**
+
+- **Deposit caps** enforced at both per-depositor and aggregate levels (~$2M and ~$100M).
+- **Limited product set** during RADI phase.
+- **Shorter runway** — 2-year clock to upgrade or exit.
+- **Scaled prudential requirements** (still real, just smaller in absolute terms).
+- **Heavier reliance on sponsor banks** for rail access (though full ADIs also use sponsors for card schemes, correspondent banking, etc.).
+
+**Why the sponsor reconciliation feels RADI-specific:**
+
+Because most RADI + neobank patterns use a sponsor for retail rails. Full ADIs have their own RBA ES account and direct scheme memberships, so their retail rail reconciliation is with RBA rather than a sponsor. But the underlying discipline — "external counterparty tells us what settled; our ledger says what we booked; they must match daily" — is identical. Only the counterparty changes.
+
+**Practical takeaway for the interview:**
+
+If asked "why double-entry and reconciliation?", the answer is NOT "because we're a RADI." The answer is "because we're a bank, and every bank does this. RADI status affects which counterparty we reconcile with (sponsor vs RBA), which product we can offer (deposit caps), and how much prudential capital we hold — but not whether we double-entry-book or reconcile."
+
+---
+
 ## Doc corrections applied
 
-The following corrections are applied in a **separate commit** so they're easy to review independently. The corrections are:
+The following corrections are applied in **separate commits** so they're easy to review independently.
+
+**From round 1 (Q1–Q21):**
 
 1. **`ACCOUNT ||--|| LEDGER_ACCOUNT` → `ACCOUNT ||--o{ LEDGER_ACCOUNT`** in `docs/05-erd-consolidated.md` and `docs/workflows/01-customer-onboarding.md`. Supports the hold sub-account model (Q5).
 2. **Add `CUSTOMER_HELD_AML`** to `LEDGER_ACCOUNT.account_class` enum in `docs/05-erd-consolidated.md` and `docs/workflows/02-inbound-direct-entry.md`. Makes the frozen-account flow explicit (Q5).
 3. **Add `RATE_VERSION ||--o{ INTEREST_ACCRUAL : "priced by"`** relationship line to Mermaid ERDs in `docs/05-erd-consolidated.md` and `docs/workflows/05-interest-accrual.md`. Fixes the missing edge (Q20).
 4. **Enhance `RECON_BREAK`** with `resolution_action`, `resolution_notes`, `proposed_by_ops_user_id`, `confirmed_by_ops_user_id`, `resolved_at` in `docs/05-erd-consolidated.md` and `docs/workflows/02-inbound-direct-entry.md`. Adds 4-eyes to break resolution (Q10).
 
-None of these change the workflow narrative — only the data model.
+**From round 2 (Q22–Q30):**
+
+5. **Add cryptographic-audit fields to `INBOUND_FILE` and `INBOUND_MESSAGE`**: `sig_algo`, `sig_value`, `sig_key_id`, `sig_version`, `sig_verified_by_key_id` (Q27). Consistent naming across both entities. Add a `SPONSOR_SIGNING_KEY` registry table for key material + rotation lifecycle.
+6. **Rename `RECON_BREAK` columns to child table `RECON_BREAK_DECISION`** for consistency with `APPLICATION_DECISION` pattern (Q22). Post-MVP refactor; document as strategic direction.
+7. **Explicitly document the daily reconciliation suite as four checks (A, B, C, D)** in `docs/workflows/02-inbound-direct-entry.md`; add per-account projection sanity check (D) alongside the aggregate checks (Q28).
+
+Items 5–7 are proposed corrections — not yet applied — so they can be reviewed and discussed before the ERD is touched again.
