@@ -110,34 +110,111 @@ The ERD lists three (`CLEAR|WATCH|HOLD`) which is the MVP minimum. The **real pr
 
 ---
 
-### Q36. Do we really need `CUSTOMER_CONSENT` — why not a boolean?
+### Q36. Do we really need `CUSTOMER_CONSENT` — shouldn't the consent text live in its own catalog table, and `CUSTOMER_CONSENT` just store `consent_id`?
 
-Yes, we need the table. A boolean fails every real question compliance will ask you.
+**Yes to both — and you're right that the current single-table shape is under-normalised.** Let me answer this in two layers, because there are two claims wrapped in the question:
 
-**What a boolean cannot answer:**
+**Layer 1 — "do we need a table at all vs a boolean?" — Yes.**
 
-| Question compliance / regulator / customer will ask | Boolean answer | `CUSTOMER_CONSENT` answer |
-|---|---|---|
-| "Which version of the T&Cs did the customer accept?" | ❌ | `SELECT version FROM customer_consent WHERE customer_id=? AND consent_type='TCS'` |
-| "When exactly did they consent?" | ❌ (or a single `consented_at` column that gets overwritten) | `granted_at` per version |
-| "Did they revoke marketing consent last Thursday?" | ❌ (overwritten) | `revoked_at` on the row |
-| "Did they consent to CDR data-sharing to Bank X, and is that consent current?" | ❌ | Separate row with `consent_type='CDR'` + version + scope |
-| "We updated the Privacy Policy in March — who's still on the old version?" | ❌ | `WHERE version < 'v2.1'` |
+A boolean fails every real question compliance will ask:
 
-**Legal drivers:**
+| Question compliance / regulator / customer will ask | Boolean answer |
+|---|---|
+| "Which version of the T&Cs did the customer accept?" | ❌ |
+| "When exactly did they consent?" | ❌ (or a single `consented_at` column that gets overwritten) |
+| "Did they revoke marketing consent last Thursday?" | ❌ (overwritten) |
+| "Did they consent to CDR data-sharing to Bank X, and is that consent current?" | ❌ |
+| "We updated the Privacy Policy in March — who's still on the old version?" | ❌ |
 
-- **Privacy Act 1988** + APPs (Australian Privacy Principles) — collection of PII requires **informed** consent; you must be able to demonstrate what the customer was informed **of**.
-- **SPAM Act 2003** — marketing opt-in is separate from service consent; withdrawal is a legal right with an audit trail.
-- **Consumer Data Right (CDR)** — under the CDR regime, every data-sharing arrangement is a versioned, revocable consent per recipient with an amendment history.
-- **ePayments Code** — the customer must have accepted the electronic-communications provisions.
+Legal drivers behind those questions: **Privacy Act 1988** (informed consent must be demonstrable), **SPAM Act 2003** (marketing opt-in is separate + revocable), **Consumer Data Right (CDR)** (versioned + revocable per recipient), **ePayments Code** (electronic-communications acceptance).
 
-**Design principle:** the table is **append-only** — you never UPDATE. Revoking marketing consent means INSERT a new row with `consent_type='MARKETING'`, `granted_at=NULL`, `revoked_at=now()`. The "current" state is `MAX(created_at)` per `(customer_id, consent_type)`. That gives you the full timeline for free.
+**Layer 2 — "shouldn't consent type/version/description live in its own catalog?" — Yes, and this is a real doc bug.**
 
-**Missing columns worth adding:**
+The current design duplicates the consent **definition** (type, version, body, effective dates) on every customer row. With 100k customers × 4 consent types × N versions, that's 400k+ rows all repeating the same 4-value `consent_type` enum and the same version strings. Same anti-pattern we'd never accept for `PRODUCT` or `RATE_VERSION`.
 
-- `granted_channel "APP|WEB|OPS_PORTAL|PHONE"` — where the consent was captured (customer paper trail).
-- `evidence_ref` — pointer to the T&Cs PDF version in S3 that the customer was shown at the time (immutable, hashed).
-- `scope jsonb` — needed for CDR (which data types, which recipient, which duration).
+**Better shape — split into a catalog + a join:**
+
+```mermaid
+erDiagram
+    CONSENT_VERSION ||--o{ CUSTOMER_CONSENT : "instantiated by"
+    CUSTOMER ||--o{ CUSTOMER_CONSENT : "grants"
+
+    CONSENT_VERSION {
+        uuid id PK
+        string consent_type "TCS|PRIVACY|MARKETING|CDR|EPAYMENTS_CODE"
+        string version "v2.1"
+        string title "Velo Terms and Conditions"
+        text summary "one-paragraph plain-English description shown to the user"
+        string body_s3_key "s3://.../consent/tcs/v2.1.pdf — the immutable full text"
+        string body_sha256 "hash of the PDF for tamper detection"
+        jsonb scope_schema "per-type schema; e.g. CDR: {data_types, recipient, duration}"
+        timestamp effective_from
+        timestamp effective_to "nullable — NULL = active"
+        uuid approved_by_ops_user_id FK
+        timestamp approved_at
+        timestamp created_at
+    }
+
+    CUSTOMER_CONSENT {
+        uuid id PK
+        uuid customer_id FK
+        uuid consent_version_id FK "→ CONSENT_VERSION.id"
+        timestamp granted_at
+        timestamp revoked_at "nullable"
+        string granted_channel "APP|WEB|OPS_PORTAL|PHONE"
+        jsonb scope "populated per CONSENT_VERSION.scope_schema (e.g. CDR recipient)"
+        string ip
+        string user_agent
+    }
+```
+
+**What moves where:**
+
+| Field | Was | Now | Why |
+|---|---|---|---|
+| `consent_type` | `CUSTOMER_CONSENT` | `CONSENT_VERSION` | It's a property of the consent definition, not the customer's acceptance. |
+| `version` | `CUSTOMER_CONSENT` | `CONSENT_VERSION` | Same. |
+| Body text / PDF pointer | (missing) | `CONSENT_VERSION.body_s3_key + body_sha256` | Single source of truth for "the text customer X agreed to". Immutable via Object Lock + hash. |
+| `granted_at`, `revoked_at` | `CUSTOMER_CONSENT` | `CUSTOMER_CONSENT` | Per-customer facts stay per-customer. |
+| `granted_channel`, `ip`, `user_agent` | (missing) | `CUSTOMER_CONSENT` | Evidence of **how** this particular customer consented — per-customer fact. |
+| `scope jsonb` | (missing) | Both — `scope_schema` on `CONSENT_VERSION`, actual `scope` on `CUSTOMER_CONSENT` | CDR: template declares "you must record data_types + recipient + duration"; customer row carries the specific values. |
+
+**Why this shape is right (and consistent with what we already do):**
+
+1. **Same pattern as `PRODUCT` → `ACCOUNT`.** `PRODUCT` is the catalog; `ACCOUNT.product_code` is the FK. Nobody would suggest inlining `PRODUCT.name` into every `ACCOUNT` row.
+2. **Same pattern as `RATE_VERSION` → `INTEREST_ACCRUAL`.** `RATE_VERSION` is the catalog with rate + day_count + effective window; `INTEREST_ACCRUAL.rate_version_id` is the FK. Same shape we're proposing here.
+3. **Single source of truth for the text.** Legal amends the T&Cs → one INSERT into `CONSENT_VERSION` → done. Today it would require agreeing "what version string do we use?" and hoping every service uses it consistently.
+4. **Approval workflow for new consent versions is first-class.** `CONSENT_VERSION.approved_by_ops_user_id` + `approved_at` gives Legal + Compliance a real 4-eyes surface. Today this is nowhere.
+5. **Analytics is one join, not a bespoke aggregation.**
+   ```sql
+   -- Who's still on old T&Cs?
+   SELECT cc.customer_id
+     FROM customer_consent cc
+     JOIN consent_version cv ON cv.id = cc.consent_version_id
+    WHERE cv.consent_type = 'TCS'
+      AND cv.version = 'v2.0'
+      AND cc.revoked_at IS NULL;
+   ```
+6. **Storage.** Instead of "TCS|v2.0" repeated 100k times, one FK column. Small win at 100k customers; large win at 10M.
+
+**Design principles preserved:**
+
+- `CUSTOMER_CONSENT` remains **append-only** — no UPDATE. Revoking marketing means INSERT a new row for the same `consent_version_id` with `granted_at=NULL, revoked_at=now()`. Current state per (customer, consent_type) is `latest(created_at)` grouped over the join.
+- Constraint enforcing "only one active version per consent_type at a time" belongs on `CONSENT_VERSION`:
+  ```sql
+  CREATE UNIQUE INDEX consent_version_active_per_type
+    ON consent_version (consent_type)
+    WHERE effective_to IS NULL;
+  ```
+  (Same partial-unique-index trick we proposed for `RATE_VERSION` in Q41.)
+
+**Trade-offs (honesty):**
+
+- **Extra JOIN on every consent read.** Negligible — `CONSENT_VERSION` will have ~20 rows, fully cached; JOIN is essentially free.
+- **Catalog now needs its own lifecycle** (draft → approved → active → superseded → retired). That's actually a **feature**, not a cost — it makes "Legal approved v2.1 of the T&Cs and it goes live at midnight" a modeled transition rather than "someone changed a string in the app."
+- **Data migration** from current shape: distinct `(consent_type, version)` pairs → seed `CONSENT_VERSION` rows → backfill `CUSTOMER_CONSENT.consent_version_id`. Straightforward, well-known pattern.
+
+**Doc correction proposed** (supersedes original item 12): split `CUSTOMER_CONSENT` into `CONSENT_VERSION` (catalog) + `CUSTOMER_CONSENT` (customer×consent join), per the ERD above. The former holds the type/version/body/scope_schema; the latter holds the per-customer grant with `consent_version_id FK` and the "how did they consent" evidence (channel/ip/UA).
 
 ---
 
@@ -942,6 +1019,6 @@ Collected here so they're easy to review. **Not yet applied to `docs/05-erd-cons
 | 9 | Add `AUDIT_LOG.correlation_id`, `service_name`, `resource_type`, `resource_id`, `reason`. | Q43 | `AUDIT_LOG` |
 | 10 | Rewrite `RECON_RUN` for four checks (`check_type`, `rail` nullable, `expected_cents`, `actual_cents`, `delta_cents`, `accounts_checked`, `accounts_with_break`). Add `RECON_ACCOUNT_SNAPSHOT` child table. Widen `RECON_BREAK.type` for Cases B, C, D. | Q44 | `RECON_RUN`, new `RECON_ACCOUNT_SNAPSHOT`, `RECON_BREAK` |
 | 11 | Document `INTEREST_ACCRUAL` partitioning strategy (`RANGE (accrual_date) MONTHLY`) in the constraints/indexes table. | Q50 | `INTEREST_ACCRUAL` |
-| 12 | Add missing `CUSTOMER_CONSENT` columns: `granted_channel`, `evidence_ref`, `scope jsonb`. | Q36 | `CUSTOMER_CONSENT` |
+| 12 | Split `CUSTOMER_CONSENT` into `CONSENT_VERSION` (catalog: type, version, title, summary, body_s3_key + body_sha256, scope_schema, effective_from/to, approval fields) + `CUSTOMER_CONSENT` (join: `customer_id` + `consent_version_id` FK, granted_at, revoked_at, granted_channel, scope, ip, user_agent). Add partial unique index `WHERE effective_to IS NULL` on `CONSENT_VERSION(consent_type)`. | Q36 | `CUSTOMER_CONSENT`, new `CONSENT_VERSION` |
 
 Items 6, 7, 10 are the biggest schema changes and should probably land as one commit each with the associated workflow-doc updates.
