@@ -1394,3 +1394,147 @@ The following corrections are applied in **separate commits** so they're easy to
 7. **Explicitly document the daily reconciliation suite as four checks (A, B, C, D)** in `docs/workflows/02-inbound-direct-entry.md`; add per-account projection sanity check (D) alongside the aggregate checks (Q28).
 
 Items 5–7 are proposed corrections — not yet applied — so they can be reviewed and discussed before the ERD is touched again.
+
+---
+
+## Third-round follow-ups (Q31–Q32)
+
+### Q31. "Message crashed BETWEEN PI insert and ledger post" — don't they commit in the same DB transaction?
+
+**They deliberately don't.** They are in **two separate DB transactions** — not because we couldn't wrap them together, but because we chose service-oriented boundaries that make same-transaction atomicity impossible (and undesirable) even in the modular monolith.
+
+**Two options — why we picked B:**
+
+**Option A — one wrapping transaction** (what your intuition suggests)
+```
+BEGIN;
+  INSERT INTO payment_instruction (status='POSTED', ...);
+  INSERT INTO transaction (...);
+  INSERT INTO posting (...) x 2;
+  UPDATE ledger_account SET available_balance_cents = ...;
+COMMIT;
+```
+- Atomic. If any step fails, nothing lands. No "orphan" PI without a transaction.
+- Simple to reason about at MVP scale.
+
+**Option B — two transactions across a service boundary** (what we ship)
+```
+TXN 1 (Payments-In owns this):
+  BEGIN;
+    INSERT INTO payments_in.payment_instruction (status='RECEIVED', ...);
+  COMMIT;
+
+... call to Ledger service (in-process today, RPC tomorrow) ...
+
+TXN 2 (Ledger owns this):
+  BEGIN;
+    INSERT INTO ledger.transaction (idempotency_key='DE|F123|42|amt', ...);
+    INSERT INTO ledger.posting (...) x 2;
+    UPDATE ledger.ledger_account SET available_balance_cents = ...;
+    INSERT INTO ledger.outbox_event (topic='money.credited', ...);
+  COMMIT;
+
+TXN 3 (Payments-In updates its own status):
+  BEGIN;
+    UPDATE payments_in.payment_instruction SET status='POSTED' WHERE id = ...;
+  COMMIT;
+```
+
+**Why B, not A:**
+
+1. **Data ownership boundary is real.** `payments_in` schema and `ledger` schema have different Postgres roles with different grants. `payments_in.*` role has no `INSERT/UPDATE` grant on `ledger.*` tables — that's what enforces "only Ledger writes ledger tables". Wrapping A's transaction requires either a single super-role (violates least-privilege) or granting cross-schema write (violates the single-writer invariant).
+2. **Split-later friendliness.** In doc 09 the plan is: `Ledger` is the first module we spin out of the monolith when it grows. Once split, `payments_in` and `ledger` are on different DBs — same-transaction is physically impossible. If our MVP relies on same-transaction, the split becomes a rewrite instead of a compartmentalised change.
+3. **Long DB transactions are bad.** A single-transaction wrap holds locks on `payment_instruction`, `transaction`, `posting`, and `ledger_account` rows across a service call. Even in-process today, that's ~40 ms of lock holding on hot rows; split tomorrow, that's a network round trip inside the lock. This kills throughput at scale.
+4. **No 2PC (XA).** The obvious "fix" — distributed transactions — is a well-known operational nightmare (recovery edge cases, coordinator failure, performance) and is not supported cleanly across Postgres roles anyway.
+5. **Retry semantics are cleaner.** If TXN 2 fails transiently, we retry ONLY TXN 2. If A were one transaction, a retry means redoing signature verify + account resolve + PI insert — pointless work.
+
+**How B is still safe:**
+
+Between TXN 1 and TXN 2, three things could crash:
+- Payments-In dies after TXN 1 commit, before calling Ledger.
+- Ledger call in flight, response never received.
+- Ledger's TXN 2 succeeded, but Payments-In dies before TXN 3 (the status update).
+
+All three converge to the same recovery pattern:
+
+```
+PI exists with status='RECEIVED' (not 'POSTED')
+  → Reconciler asks Ledger: does a transaction with idempotency_key exist?
+    → YES  : mark PI.status='POSTED' (TXN 3 completes)
+    → NO   : call Ledger.post again with the same idempotency_key
+             → new insert or already-exists — either way, terminal 'POSTED'
+```
+
+The reconciler is a scheduled job that runs every ~5 min:
+```sql
+SELECT id, ... FROM payment_instruction
+WHERE status IN ('RECEIVED', 'MATCHED')
+  AND created_at < now() - interval '2 minutes';
+```
+
+Anything older than a small grace window is a candidate for recovery. Because the ledger call is idempotent (via the deterministic key), the recovery is safe — worst case is a re-check that finds "already posted".
+
+**The trade-off summary the panel will want:**
+
+> "Wrapping PI + Ledger in one DB transaction is tempting for MVP simplicity, but it hard-couples two bounded contexts and prevents the Ledger service from being split out later without a rewrite. We chose service boundaries + idempotency + reconciler recovery instead. The extra reconciliation step is a small operational cost we've explicitly accepted."
+
+**One more thing to be honest about:** even IF PI + Ledger were in one transaction, we'd STILL need idempotency for the other failure modes (sponsor retries the webhook after a network timeout that lost our response; sponsor re-sends a file "to be safe"). So idempotency is not an artefact of the split — it's a baseline requirement for any external-facing money system. The split just means we ALSO need the reconciler for internal orphan cleanup.
+
+---
+
+### Q32. What is `INBOUND_MESSAGE.status = REPLAY_QUEUED` — and when does the message move to the DLQ?
+
+`REPLAY_QUEUED` is a specific handoff state: **"we've saved evidence of this webhook and taken ownership of processing it internally; the sponsor no longer needs to retry."**
+
+**Full `INBOUND_MESSAGE.status` lifecycle:**
+
+```mermaid
+stateDiagram-v2
+    [*] --> RECEIVED : webhook arrives, sig verified, row inserted
+    RECEIVED --> POSTED : Ledger.post succeeds
+    RECEIVED --> REJECTED : account frozen / RADI cap / business rule (200 + accept:false to sponsor)
+    RECEIVED --> RECEIVED : Ledger.post failed transiently, returned 503, sponsor retries
+    RECEIVED --> REPLAY_QUEUED : sponsor gave up (or ops takes ownership); we drive it internally
+    REPLAY_QUEUED --> POSTED : internal retry succeeded
+    REPLAY_QUEUED --> DLQ : internal retries exhausted; engineer intervention required
+    DLQ --> POSTED : engineer resolves + manually re-triggers
+    DLQ --> REJECTED : engineer decides message can't be posted; return to sponsor manually
+    POSTED --> [*]
+    REJECTED --> [*]
+```
+
+**Two-phase retry model:**
+
+**Phase 1 — Sponsor-driven retries** (while status = `RECEIVED`)
+- Sponsor sends webhook; we return 5xx; sponsor retries per their retry policy (typically 5–10 retries over 24 h with exp backoff).
+- Each retry: our webhook handler does the same flow — signature check, idempotency check, INSERT INBOUND_MESSAGE (deduped on `sponsor_msg_id`), attempt Ledger.post.
+- If eventually Ledger.post succeeds → `POSTED`, we return 200, we're done.
+- If sponsor's retry budget is exhausted and we still haven't got a `POSTED` → sponsor stops retrying and typically escalates to us via a support channel or a daily reconciliation file.
+
+**Phase 2 — Velo-driven retries** (status = `REPLAY_QUEUED`)
+- Ops (or the reconciler, once we have automated escalation) explicitly promotes the message: `UPDATE INBOUND_MESSAGE SET status='REPLAY_QUEUED'`, publishes `{sponsor_msg_id}` onto the internal `sqs-webhook-replay` queue.
+- An internal replay consumer picks it up, calls Ledger.post with the same idempotency key.
+- SQS visibility timeout + redelivery drives retries (e.g. every 10 min, up to 20 attempts over 48 h).
+
+**When it goes to DLQ:**
+
+Two paths — one automatic, one human-driven:
+
+1. **Automatic (SQS redelivery limit hit).** The `sqs-webhook-replay` queue has `maxReceiveCount = 20`. After 20 redeliveries fail, SQS itself moves the message to `sqs-webhook-replay-dlq`. A CloudWatch alarm on DLQ depth ≥ 1 pages the on-call engineer. We can OPTIONALLY set `INBOUND_MESSAGE.status = DLQ` in the same code path so it's discoverable via DB queries.
+2. **Manual (Ops escalation).** Ops looks at a message that's been REPLAY_QUEUED for > 24 h with no progress, flips it to DLQ, adds a note, opens an incident ticket.
+
+**What "engineer intervention" looks like at DLQ:**
+
+Common categories:
+- **Data problem in the payload** — sponsor sent something we can't parse. Engineer patches the parser + reprocesses (`DLQ → REPLAY_QUEUED → POSTED`).
+- **Account genuinely doesn't exist and never will** — engineer decides to `REJECTED` and coordinates a return to sender with sponsor manually.
+- **Persistent ledger inconsistency** — deeper investigation; may involve treasury/compliance if the amount is material.
+- **Sponsor sent something wrong** — engineer coordinates with sponsor to void the message; internally mark `REJECTED` with reason `SPONSOR_VOID`.
+
+**Why DLQ is not "just delete it":**
+
+Every message in DLQ represents customer money sitting in the sponsor pool without a ledger entry. That's a **regulatory event** in the making — a customer whose deposit isn't showing up. AUSTRAC + APRA notification thresholds kick in if the delay exceeds a defined window. So DLQ items are high-priority and must have a human-attached resolution, not silent dropping.
+
+**Doc alignment note:**
+
+Workflow doc 03 previously described the flow as "if ledger is unavailable → 503 → sponsor retries" *and* "persistently failing messages land on the webhook-replay DLQ" but didn't clearly distinguish **who** is retrying at each stage. Q32 makes that boundary explicit: sponsor drives Phase 1, Velo drives Phase 2, DLQ is engineer-attached. Worth mirroring this state-machine picture into the workflow doc if you want to update it — happy to make that edit on request.
