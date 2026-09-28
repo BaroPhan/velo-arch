@@ -166,7 +166,7 @@ flowchart TB
           Id[Identity]:::svc
           Onb[Onboarding]:::svc
           Acc[Account]:::svc
-          Tx[Transfers]:::svc
+          Tx[Transfers<br/><i>customer send-money</i><br/>validate · limits · step-up<br/>then Ledger.post]:::svc
           PS[PayID]:::svc
         end
         subgraph MoneyGrp["Money movement"]
@@ -187,16 +187,17 @@ flowchart TB
     %% ─── Row 4: State (Postgres + Redis + S3s) ───
     subgraph State["Data  (state)"]
       direction LR
-      PG[(Postgres<br/><i>+ Outbox table</i>)]:::data
+      PG[(Postgres<br/>business tables)]:::data
+      OB[(outbox_event<br/><i>the only table CDC publishes</i>)]:::data
       Rd[(Redis)]:::data
       S3K[(S3 KYC docs)]:::data
       S3I[(S3 inbound-files)]:::data
     end
 
-    %% ─── Row 5: Event backbone (async fan-out) ───
-    subgraph EventBus["Event backbone  (Postgres → CDC → Kafka → consumers)"]
+    %% ─── Row 5: Event backbone (outbox only — not every WAL change) ───
+    subgraph EventBus["Event backbone  (outbox_event → Debezium → Kafka)"]
       direction LR
-      CDC[Debezium CDC<br/>tails Postgres WAL]:::infra
+      CDC[Debezium CDC<br/><i>publication = outbox_event</i><br/>business tables are not published]:::infra
       Kf[[Kafka event bus]]:::data
       S3A[(S3 audit-lake<br/>7-yr Object Lock)]:::data
     end
@@ -234,13 +235,14 @@ flowchart TB
     Recon --> SBA
     SBA ==>|REST + mTLS| SP2
 
-    %% Row 3 → Row 4 : domain owns state (3 arrows, not 8)
+    %% Row 3 → Row 4 : domain owns state. Outbox row is written in the SAME txn as the business write.
     Domain --> PG
+    Domain -->|same DB transaction| OB
     MoneyGrp --> Rd
     Onb --> S3K
 
-    %% Row 4 → Row 5 : outbox event backbone (all forward)
-    PG -->|WAL| CDC
+    %% Row 4 → Row 5 : CDC publishes outbox_event only — not every table's WAL
+    OB --> CDC
     CDC --> Kf
     Kf --> S3A
 
@@ -277,8 +279,8 @@ flowchart TB
 **Reading this diagram top-to-bottom:**
 1. **Rows 1–2** — Clients enter through one of the 3 API surfaces. Sponsor Bank (`SP1`) enters via the Webhook Receiver.
 2. **Row 3** — Domain services on the left (grouped by role, 10 modules), Anti-Corruption Layer on the right — the *only* module that talks to the sponsor (`SP2`).
-3. **Row 4** — State. Every domain service writes into its own Postgres schema; money-movement services also cache in Redis; Onboarding writes uploaded ID docs to S3-KYC.
-4. **Rows 5–6** — Async event backbone. Postgres WAL → Debezium CDC → Kafka → (a) audit-lake mirror, (b) Notifications service → per-channel SQS → external providers.
+3. **Row 4** — State. Every domain service writes into its own Postgres schema **and**, in the same transaction, an `outbox_event` row. Money-movement services also cache in Redis; Onboarding writes uploaded ID docs to S3-KYC.
+4. **Rows 5–6** — Async event backbone. Debezium's publication is **`outbox_event` only** — it does not publish `transaction`, `posting`, `ledger_account`, or any other business table. Kafka then fans out to (a) the audit-lake mirror and (b) Notifications → per-channel SQS → external providers.
 5. **Left sidebar** — Scheduler triggers money-movement services and pulls SFTP files into S3-inbound.
 
 **Arrow-reduction techniques used** (roughly half the edge count of the original mega-diagram):
@@ -386,7 +388,7 @@ flowchart LR
     end
 
     OB[(Outbox table<br/>in each service's Postgres schema)]:::data
-    CDC[Debezium CDC<br/>tails Postgres WAL]:::infra
+    CDC[Debezium CDC<br/>publication = outbox_event only<br/>business tables are not published]:::infra
     KF[[Kafka topics<br/>money.credited / .debited / .moved<br/>customer.onboarded / .kyc_rejected<br/>account.opened / .frozen / .unfrozen<br/>rate.changed<br/>interest.accrued / .capitalised<br/>recon.closed / .break<br/>payid.registered / .deregistered]]:::data
 
     Producers --> OB --> CDC --> KF
@@ -418,7 +420,7 @@ flowchart LR
 ```
 
 **Key points:**
-- **Producers never call Kafka directly.** They insert into a Postgres `outbox_event` row inside their business transaction. Debezium picks it up post-commit.
+- **Producers never call Kafka directly.** They insert into a Postgres `outbox_event` row inside their business transaction. Debezium's logical replication publication is **that table only** — a change to `posting` or `customer` does not become a Kafka message unless the service also wrote an outbox row.
 - **The same log serves MVP consumers and future consumers** — Fraud, AML, CDR, Analytics can subscribe later without any change to the producers. That's the roadmap-friendly seam the panel is looking for.
 - **Kafka retains for 7 days; the audit-lake S3 mirror retains for 7 years** (Object Lock in Compliance mode).
 
@@ -557,6 +559,28 @@ The Velo backend is a **modular monolith** with 10 domain modules + 2 boundary m
 | 12 | **Ops Portal API** *(boundary)* | HTTP layer serving Ops web app; wires 4-eyes to underlying services | (none — proxies to owning services) | REST endpoints per capability | (via underlying services) | — | — |
 | 13 | *Fraud* | Stub in MVP (`ALLOW` everything); real rules engine in roadmap | (none in MVP) | `scoreTransfer` | (via consumer of `money.moved`) | `money.moved` (roadmap) | — |
 
+### Transfers — what the customer-facing service is actually in charge of
+
+Transfers is the **Send Money** orchestrator. It is the only customer entry point for moving money between two Velo accounts. It does **not** own a balance, a posting, or a Kafka topic.
+
+**It does:**
+
+1. Serve `POST /transfers` behind the Customer API (Cognito JWT).
+2. Check the caller **owns the source account**. The `from_account` in the body is not trusted on its own.
+3. Ask Identity for **step-up MFA** when the amount crosses the threshold (biometric / TOTP).
+4. Ask Account to **resolve the payee** (must be an `ACTIVE` Velo account in MVP; external BSB is rejected).
+5. Enforce the rules that are **not** ledger rules: per-transaction limit, per-day limit, cool-off on a newly added payee, source account not `FROZEN` or `CLOSED`.
+6. Call the fraud stub (`scoreTransfer`). MVP always returns `ALLOW`. The seam is here so a real scorer can be plugged in later without touching Ledger.
+7. Build one idempotent instruction and call `Ledger.postTransaction` — two postings, `DR` payer / `CR` payee, `type=INTERNAL_TRANSFER`, client `idempotency_key`. A retry of the same key cannot send the money twice.
+8. Return the new source balance to the app on the same HTTP call (~200 ms).
+
+**It does not:**
+
+- Write `transaction`, `posting`, or `ledger_account`. Ledger is the sole writer. A compromised Transfers process still cannot mutate the books except through Ledger's API.
+- Talk to the sponsor, NPP, or DE. An internal transfer does not move the sponsor pool.
+- Publish to Kafka. Ledger inserts the `outbox_event` (`money.moved`) in the same transaction as the postings; Notifications hears about it from Kafka afterwards.
+- Store the payee address book. That table belongs to Account. Transfers only reads it.
+
 **Ownership rule:** Only the service that owns a table may write to it. Others read via the owning service's API. Enforced by:
 - One Postgres role per module; only that role has `INSERT/UPDATE` grants on its own tables.
 - Code review — cross-schema queries are a smell.
@@ -604,7 +628,7 @@ The exact who-calls-whom picture is in **Diagram 3** above. The invariants worth
 
 - **One logical DB, one schema per module** (`onboarding`, `account`, `ledger`, `transfers`, `payments_in`, `payid`, `interest`, `reconciliation`).
 - Each module has its own migration folder and its own Postgres role. Cross-schema `SELECT`s are allowed for read models; cross-schema `INSERT/UPDATE` is forbidden by grants.
-- **Ledger schema is special** — it's the only place with `SERIALIZABLE` isolation on writes, WAL-based CDC tailed by Debezium, and DB-level triggers enforcing double-entry (`SUM(posting.amount * sign) = 0` per transaction per currency).
+- **Ledger schema is special** — it's the only place with `SERIALIZABLE` isolation on writes, and DB-level triggers enforcing double-entry (`SUM(posting.amount * sign) = 0` per transaction per currency). Debezium does **not** publish the ledger tables; it publishes `outbox_event` only.
 
 ### Redis (ElastiCache) — the cache tier
 
@@ -635,7 +659,7 @@ Three distinct messaging surfaces used for different jobs. Confusing them is the
 
 ### 1. Outbox table + Debezium → Kafka (for domain events)
 
-**Pattern:** every service that publishes an event inserts an `outbox_event` row inside the **same DB transaction** as its business write. Debezium tails Postgres WAL and publishes each row to the matching Kafka topic. The service never calls Kafka directly.
+**Pattern:** every service that publishes an event inserts an `outbox_event` row inside the **same DB transaction** as its business write. Debezium (MSK Connect) uses a Postgres publication that includes **`outbox_event` and nothing else**, and publishes each new row to the Kafka topic named in that row. The service never calls Kafka directly. Postgres still uses the WAL as the transport for logical replication — that is how Debezium reads — but the connector filter drops every change that is not an outbox insert. Renaming a column on `posting` does not change the event contract.
 
 ```
 BEGIN;

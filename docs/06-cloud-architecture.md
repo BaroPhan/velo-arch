@@ -1,6 +1,6 @@
 # 06 — High-level Cloud Architecture
 
-This is the architecture diagram you attach to the submission email, plus the service-by-service story.
+AWS placement of the same system drawn in [`docs/09-internal-system-architecture.md`](09-internal-system-architecture.md) Diagram 2. Diagram 2 is the picture to attach for the high-level architecture deliverable — it already shows the services, the sponsor boundary, and the event path. This page is the cloud-posture companion (region, edge, DR) if the panel asks where it runs.
 
 ## Guiding principles
 
@@ -14,145 +14,143 @@ This is the architecture diagram you attach to the submission email, plus the se
 
 ## Architecture diagram
 
+Drawn as one forward pass, top to bottom. Group arrows stand in for the per-service lines (those live in [`docs/09-internal-system-architecture.md`](09-internal-system-architecture.md)). Every box on this page has a completed path; KMS, Secrets Manager, Shield, and multi-AZ are called out underneath rather than drawn as a second web of dotted lines.
+
 ```mermaid
+---
+config:
+  flowchart:
+    defaultRenderer: elk
+---
 flowchart TB
-    subgraph Users
-      Cust[Customer<br/>PWA + React Native]
-      Ops[Ops user<br/>Web browser]
+    subgraph Clients
+      direction LR
+      Cust[Customer app<br/>PWA + React Native]
+      Ops[Ops portal]
     end
 
-    subgraph Edge[AWS Edge - global]
-      CF[CloudFront + AWS WAF + Shield]
-      Cognito[(Cognito<br/>Customer + Ops pools)]
+    subgraph Edge["Edge  ·  ap-southeast-2"]
+      direction LR
+      CF[CloudFront + WAF]
+      Cog[Cognito<br/>customer pool + ops pool]
+      VA[Verified Access<br/>ops only]
     end
 
-    subgraph OpsAccess[Zero-trust]
-      VA[AWS Verified Access]
+    subgraph Ingress
+      direction LR
+      APIGW[API Gateway<br/>customer + ops]
+      WH[Webhook receiver<br/>mTLS + HMAC]
     end
 
-    subgraph SponsorNet[Sponsor Bank]
-      SBS[SFTP endpoint<br/>DE files]
-      SBW[NPP webhook client<br/>mTLS]
-      SBAPI[REST APIs<br/>PayID mgmt, statements]
-    end
-
-    subgraph VPC[VPC ap-southeast-2 - private subnets across 3 AZ]
-      subgraph Ingress
-        APIGW[API Gateway + ALB]
+    subgraph App["Application  ·  ECS Fargate, private subnets, 3 AZ"]
+      direction LR
+      subgraph CustSvcs["Customer-facing"]
+        direction TB
+        Onb[Onboarding]
+        Id[Identity]
+        Acc[Account]
+        Tx[Transfers<br/>send-money orchestrator]
+        PSvc[PayID]
       end
-
-      subgraph AppTier[Application services - ECS Fargate]
-        Onb[Onboarding Svc]
-        Id[Identity Svc<br/>Cognito facade]
-        Acc[Account Svc]
-        Led[Ledger Svc]
-        PIn[Payments-In Svc]
-        Tx[Transfers Svc]
-        Int[Interest Svc]
-        Notif[Notifications Svc]
+      subgraph Money["Money movement"]
+        direction TB
+        PIn[Payments-In]
+        Int[Interest]
+        Led[Ledger<br/>sole writer of postings]
+      end
+      subgraph Control["Control"]
+        direction TB
         OpsAPI[Ops Portal API]
-        Adapter[Sponsor-Bank Adapter<br/>ACL]
-        Recon[Recon Svc]
-        PSvc[PayID Svc]
+        Recon[Reconciliation]
+        Notif[Notifications]
       end
-
-      subgraph DataTier[Data]
-        Aurora[(Aurora PostgreSQL<br/>Multi-AZ, cross-region replica)]
-        Redis[(ElastiCache Redis<br/>Multi-AZ)]
-        MSK[[Kafka MSK<br/>3 AZ]]
-        MSKC[MSK Connect<br/>Debezium CDC]
-      end
-
-      subgraph Storage
-        S3Kyc[(S3 KYC bucket<br/>SSE-KMS, Object Lock)]
-        S3In[(S3 inbound-files<br/>SSE-KMS, Object Lock)]
-        S3Audit[(S3 audit-lake<br/>7yr Object Lock)]
-      end
-
-      subgraph Security
-        KMS[KMS CMKs]
-        Sec[Secrets Manager]
-        WAFv2[WAF rules]
-      end
-
-      subgraph SFTPBox
-        SFTPPull[SFTP puller<br/>ECS scheduled]
-      end
+      Adapter[Sponsor-Bank<br/>Adapter]
     end
 
-    subgraph Comms[External comms]
+    subgraph Data["Data"]
+      direction LR
+      Aurora[(Aurora PostgreSQL<br/>business tables)]
+      OB[(outbox_event<br/>only published table)]
+      Redis[(ElastiCache Redis)]
+      S3[(S3<br/>KYC · inbound files · audit lake)]
+    end
+
+    subgraph Bus["Events  ·  outbox only, not every WAL change"]
+      direction LR
+      MSKC[MSK Connect<br/>Debezium<br/>publication = outbox_event]
+      MSK[[Kafka MSK]]
+    end
+
+    subgraph Sponsor["Sponsor bank"]
+      direction TB
+      SBW[NPP webhook]
+      SBS[SFTP<br/>DE files]
+      SBAPI[REST<br/>PayID + statements]
+    end
+
+    subgraph Comms["Customer comms"]
+      direction LR
       SES[SES]
       Twilio[Twilio]
-      APNs[APNs/FCM]
-      PagerDuty[PagerDuty]
+      Push[APNs / FCM]
     end
 
-    subgraph DR[ap-southeast-4]
+    subgraph DR["DR  ·  ap-southeast-4"]
+      direction LR
       AuroraDR[(Aurora replica)]
-      S3DR[(S3 CRR replicas)]
+      S3DR[(S3 cross-region replicas)]
     end
 
     Cust --> CF --> APIGW
     Ops --> VA --> APIGW
-    Cust -.OIDC.-> Cognito
-    Ops -.OIDC.-> Cognito
+    Cust -.->|OIDC| Cog
+    Ops -.->|OIDC| Cog
 
-    APIGW --> Onb
-    APIGW --> Id
-    APIGW --> Acc
-    APIGW --> Tx
+    APIGW --> CustSvcs
     APIGW --> OpsAPI
-    APIGW --> PIn
-    APIGW --> PSvc
+    SBW -->|signed webhook| WH --> PIn
 
-    Onb --> Aurora
-    Onb --> S3Kyc
-    Onb --> MSK
-    Acc --> Aurora
-    Tx --> Acc
+    CustSvcs --> Aurora
+    Money --> Aurora
+    Control --> Aurora
     Tx --> Led
-    Tx --> Redis
-    PIn --> Adapter
-    PIn --> Acc
     PIn --> Led
-    PIn --> Redis
-    Int --> Aurora
     Int --> Led
-    Led --> Aurora
-    Recon --> S3In
-    Recon --> Aurora
-    Recon --> MSK
-    OpsAPI --> Onb
-    OpsAPI --> Acc
-    OpsAPI --> Led
-    OpsAPI --> Recon
-    OpsAPI --> S3Kyc
+    Money --> Redis
 
-    Adapter <-. mTLS + HMAC .-> SBW
-    Adapter --> SBAPI
-    SFTPPull <-. SFTP over VPN/DirectConnect .-> SBS
-    SFTPPull --> S3In
-    S3In -- Event --> PIn
+    Onb --> S3
+    SBS -->|scheduled SFTP pull| S3
+    S3 -->|object-created event| PIn
+    Recon --> S3
 
-    Aurora -- WAL --> MSKC --> MSK
+    Aurora -->|same transaction| OB
+    OB --> MSKC --> MSK
     MSK --> Notif
+    MSK --> S3
+
+    PIn --> Adapter
+    PSvc --> Adapter
+    Recon --> Adapter
+    Adapter -->|mTLS| SBAPI
+
     Notif --> SES
     Notif --> Twilio
-    Notif --> APNs
-    MSK --> S3Audit
+    Notif --> Push
+    Recon -->|break pages on-call| PD[PagerDuty]
 
     Aurora ==> AuroraDR
-    S3Audit ==> S3DR
-    S3Kyc ==> S3DR
-    S3In ==> S3DR
+    S3 ==> S3DR
 
-    Adapter -.-> Sec
-    Led -.-> KMS
-    S3Kyc -.-> KMS
-    S3In -.-> KMS
-    S3Audit -.-> KMS
-    Recon --> PagerDuty
+    classDef ext fill:#e5e7eb,stroke:#374151,color:#111
+    class SBW,SBS,SBAPI,SES,Twilio,Push,PD,Cog ext
 ```
+
+**Present on every deployment, omitted from the drawing on purpose** (drawing them adds arrows and no new decision):
+
+- **KMS CMKs** encrypt Aurora, all three S3 buckets, and Secrets Manager. One CMK per data class (`data-kyc`, `data-ledger`, `data-inbound`).
+- **Secrets Manager** holds the sponsor mTLS material and HMAC secret. Only the Sponsor-Bank Adapter's task role can read them.
+- **Shield + WAF** sit on CloudFront. The WAF box above is that control; there is no second WAF inside the VPC.
+- **Multi-AZ** is the default for Aurora, Redis, MSK, and ECS. The Melbourne box is the cross-region copy, not a second AZ.
 
 ## Service-by-service
 
@@ -163,7 +161,7 @@ flowchart TB
 | **Account Svc** | `accounts`, allocation of BSB+acct, freeze/close state | Ledger, Aurora | Sync | Only service allowed to open ledger accounts |
 | **Ledger Svc** | `transactions`, `postings`, `ledger_accounts`, `outbox_events` | Aurora, KMS | Sync | Sole writer to the ledger tables; enforces double-entry |
 | **Payments-In Svc** | Ingest of DE + NPP; `inbound_files`, `inbound_messages`, `payment_instructions` | Sponsor Adapter, Account Svc, Ledger, MSK, Redis | Sync (NPP webhooks), async (DE files) | Idempotent posting; unmatched queue |
-| **Transfers Svc** | Customer-initiated internal transfers | Account Svc, Ledger, Fraud stub | Sync | Enforces limits, step-up MFA, idempotency |
+| **Transfers Svc** | Customer send-money orchestrator. No tables of its own | Account (resolve payee), Identity (step-up), Ledger (`postTransaction`), fraud stub | Sync | Owns validation, limits, cool-off, idempotency key. Does **not** write postings and does **not** call Kafka or the sponsor |
 | **Interest Svc** | Daily accrual + monthly capitalisation; `interest_accruals`, `rate_versions` | Aurora, Ledger, MSK | Async (scheduled) | Idempotent per (account, date/month) |
 | **PayID Svc** | `payid_registrations` | Sponsor Adapter, Aurora | Sync | Registration + de-registration with sponsor |
 | **Sponsor-Bank Adapter** | Talks to sponsor's REST + SFTP; hides sponsor schema | Sponsor bank, Secrets Mgr | Both | Anti-corruption layer; only place sponsor SDK lives |

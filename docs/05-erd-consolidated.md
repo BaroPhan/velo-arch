@@ -2,6 +2,8 @@
 
 This is the ERD you attach to the submission email. It stitches together every model touched by the five MVP workflows.
 
+Rendered copies (same diagram, for the email attachment): [`docs/exports/velo-erd.svg`](exports/velo-erd.svg) and [`docs/exports/velo-erd.png`](exports/velo-erd.png).
+
 ## Design principles baked in
 
 1. **Money is stored in minor units (cents) as `BIGINT`.** Never float, never decimal-string. Always paired with a `currency` column even though MVP is AUD-only.
