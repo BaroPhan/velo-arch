@@ -621,35 +621,24 @@ Both are answering "which payment rail delivered this?". `source` is ambiguous (
 
 ### Q47. Was `INBOUND_MESSAGE` ever updated with the sig-audit fields from Q27?
 
-**No — the Q27 correction is still proposed, not applied.** Both `INBOUND_FILE` and `INBOUND_MESSAGE` still carry only `sig_verified boolean` (in fact `INBOUND_FILE` doesn't even carry that — it has no sig field at all today).
+**Now yes — applied to `docs/05-erd-consolidated.md`.** Both `INBOUND_FILE` and `INBOUND_MESSAGE` now carry:
 
-**Recap of what Q27 proposed:**
+- `sig_algo` — e.g. `RSA-PSS-SHA256`, `ECDSA-P256-SHA256`, `HMAC-SHA256`.
+- `sig_value` — the signature bytes (base64).
+- `sig_key_id` — the key ID the sponsor claims signed it.
+- `sig_version` — sponsor's signing scheme version (for graceful key rotation).
+- `sig_verified boolean` — the summary of our verification result (fast index for "any failed sigs recently?").
 
-- Add to **both** entities:
-  - `sig_algo` — e.g. `RSA-PSS-SHA256`, `ECDSA-P256-SHA256`, `HMAC-SHA256`.
-  - `sig_value` — the signature bytes (base64).
-  - `sig_key_id` — the key ID the sponsor claims signed it (from their JWKS or key registry).
-  - `sig_version` — sponsor's signing scheme version (for graceful key rotation).
-  - `sig_verified_by_key_id` — which key **we** used to verify (populated on successful verify; can differ from `sig_key_id` during rotation windows).
-- Keep `sig_verified boolean` as the summary indicator (fast index for "any failed sigs recently?").
-- Add a `SPONSOR_SIGNING_KEY` registry table:
-  ```
-  SPONSOR_SIGNING_KEY {
-    key_id       string PK    "matches sig_key_id claimed by sponsor"
-    key_pem      text         "or reference to KMS"
-    algo         string
-    valid_from   timestamp
-    valid_to     timestamp    "nullable"
-    revoked_at   timestamp    "nullable — accelerated revocation"
-    rotated_by_ops_user_id uuid FK
-  }
-  ```
+**Why we captured all four sponsor-sent fields (not just the boolean):**
 
-**Why the audit fields matter more than the boolean:**
+A `sig_verified = true` alone is **unauditable**. If a year from now an investigator asks "prove that this NPP message was signed by the sponsor", we can't — we threw away the evidence. Storing `sig_algo` + `sig_value` + `sig_key_id` + `sig_version` lets us re-verify any historical message at any time, and gives us the forensic trail if a key is later revoked.
 
-A `sig_verified = true` today with no captured signature is **unauditable**. If a year from now an investigator asks "prove that this NPP message was signed by the sponsor", we can't — we threw away the evidence. The audit fields let us re-verify any historical message at any time, and give us the forensic trail if a key is later revoked.
+**What we deliberately did NOT add:**
 
-**Status:** these fields still need to land in the ERD. Same "proposed correction" bucket as the others.
+1. **`SPONSOR_SIGNING_KEY` registry table.** Key material, rotation, and revocation are the **sponsor's** responsibility — we don't manage their keys, we just verify what they send. If we ever needed to pin our own copy of their public key for independent verification, we'd add it then. Not before.
+2. **`sig_verified_by_key_id`** (which key **we** used to verify vs which the sponsor claimed). Redundant given the sponsor is required to send `sig_key_id` + `sig_version` on every message — the "which key was used" question is answered by `sig_key_id` directly. Any mismatch during a sponsor-side rotation is the sponsor's problem to reconcile via the version bump.
+
+Documented as a "not in ERD" note in `docs/05-erd-consolidated.md` so a future reader knows this was an explicit design decision, not an oversight.
 
 ---
 
@@ -669,15 +658,18 @@ A `sig_verified = true` today with no captured signature is **unauditable**. If 
 | `status` | `RECEIVED \| PARSED \| POSTED \| QUARANTINED` | RECEIVED = downloaded from sponsor SFTP; PARSED = decomposed into PIs; POSTED = every PI landed in ledger; QUARANTINED = something failed and it's parked for ops. |
 | `received_at` | When we downloaded/ingested the file. | Along with `sponsor.file_generated_at` (missing today) forms the latency SLA measurement. |
 
-**What's missing (should be added):**
+**What was missing — now landed (per Q47):**
 
-1. **Signature-audit fields** (per Q47): `sig_algo`, `sig_value`, `sig_key_id`, `sig_version`, `sig_verified`, `sig_verified_by_key_id`. Today the file's authenticity is implied by "it came off the sponsor's SFTP box we're authorised against", but no forensic trail is captured.
-2. **`sponsor_file_generated_at`** — when the sponsor declares they generated the file (from the header). Different from `received_at`. Latency measurement + a signal for stale files.
-3. **`file_type`** — `DE_CREDITS`, `DE_RETURNS`, `RECON_REPORT`. Today implicit; making it explicit lets the ingest job route to different processors without inspecting file contents.
-4. **`processed_by`** — the service instance / worker ID that consumed it. Debugging aid.
-5. **`error_reason`** — populated on `QUARANTINED`. Enum-ish (`SCHEMA_INVALID`, `SIG_INVALID`, `HEADER_MISMATCH`, `DUPLICATE_SPONSOR_FILE_ID`, `UNKNOWN`).
+- **Signature-audit fields** — `sig_algo`, `sig_value`, `sig_key_id`, `sig_version`, `sig_verified`. All applied to both `INBOUND_FILE` and `INBOUND_MESSAGE` in the ERD.
 
-**Recommended target shape:**
+**What's still missing (proposed, not yet applied):**
+
+1. **`sponsor_file_generated_at`** — when the sponsor declares they generated the file (from the header). Different from `received_at`. Latency measurement + a signal for stale files.
+2. **`file_type`** — `DE_CREDITS`, `DE_RETURNS`, `RECON_REPORT`. Today implicit; making it explicit lets the ingest job route to different processors without inspecting file contents.
+3. **`processed_by`** — the service instance / worker ID that consumed it. Debugging aid.
+4. **`error_reason`** — populated on `QUARANTINED`. Enum-ish (`SCHEMA_INVALID`, `SIG_INVALID`, `HEADER_MISMATCH`, `DUPLICATE_SPONSOR_FILE_ID`, `UNKNOWN`).
+
+**Recommended target shape (including all of the above):**
 
 ```mermaid
 erDiagram
@@ -695,7 +687,6 @@ erDiagram
         string sig_key_id
         string sig_version
         boolean sig_verified
-        string sig_verified_by_key_id
         string status "RECEIVED|PARSED|POSTED|QUARANTINED"
         string error_reason
         string processed_by
@@ -704,7 +695,7 @@ erDiagram
     }
 ```
 
-**Doc correction proposed:** apply the above shape; symmetric changes to `INBOUND_MESSAGE`.
+**Doc correction proposed:** apply the four remaining fields (`file_type`, `sponsor_file_generated_at`, `processed_by`, `error_reason`) to `INBOUND_FILE`; symmetric additions where they make sense on `INBOUND_MESSAGE` (`processed_by`, `error_reason`).
 
 ---
 
@@ -1013,7 +1004,7 @@ Collected here so they're easy to review. **Not yet applied to `docs/05-erd-cons
 | 3 | Drop `LEDGER_ACCOUNT.pending_balance_cents`; rename `available_balance_cents` → `balance_cents`; add `v_account_positions` view exposing `spendable` and `total_owned`. | Q45 | `LEDGER_ACCOUNT` |
 | 4 | Extend `PAYID_REGISTRATION.status` enum with `PORTED_OUT` and `CONFLICT`. Make `UNIQUE(alias_type, alias_value)` partial on `status='ACTIVE'`. | Q40 | `PAYID_REGISTRATION` |
 | 5 | Rename `INBOUND_FILE.source` → `INBOUND_FILE.rail`. Widen values with room for `HVCS`. | Q46 | `INBOUND_FILE` |
-| 6 | Add signature-audit fields (`sig_algo`, `sig_value`, `sig_key_id`, `sig_version`, `sig_verified`, `sig_verified_by_key_id`) to **both** `INBOUND_FILE` and `INBOUND_MESSAGE`. Add `SPONSOR_SIGNING_KEY` registry table. (This is the Q27 item, still pending.) | Q27, Q47, Q48 | `INBOUND_FILE`, `INBOUND_MESSAGE`, new `SPONSOR_SIGNING_KEY` |
+| 6 | ✅ **APPLIED.** Signature-audit fields (`sig_algo`, `sig_value`, `sig_key_id`, `sig_version`, `sig_verified`) added to **both** `INBOUND_FILE` and `INBOUND_MESSAGE`. Explicitly **not** added: `SPONSOR_SIGNING_KEY` registry table (sponsor owns their key lifecycle) and `sig_verified_by_key_id` (redundant given the sponsor sends `sig_key_id` + `sig_version` on every message). Documented in the ERD's "not in ERD (roadmap)" section. | Q27, Q47, Q48 | `INBOUND_FILE`, `INBOUND_MESSAGE` |
 | 7 | Add `INBOUND_FILE.file_type`, `sponsor_file_generated_at`, `processed_by`, `error_reason`. | Q48 | `INBOUND_FILE` |
 | 8 | Add `PAYMENT_INSTRUCTION.remittance_reference` alongside `end_to_end_ref` (keep both — different semantics for outbound). | Q49 | `PAYMENT_INSTRUCTION` |
 | 9 | Add `AUDIT_LOG.correlation_id`, `service_name`, `resource_type`, `resource_id`, `reason`. | Q43 | `AUDIT_LOG` |
@@ -1021,4 +1012,4 @@ Collected here so they're easy to review. **Not yet applied to `docs/05-erd-cons
 | 11 | Document `INTEREST_ACCRUAL` partitioning strategy (`RANGE (accrual_date) MONTHLY`) in the constraints/indexes table. | Q50 | `INTEREST_ACCRUAL` |
 | 12 | Split `CUSTOMER_CONSENT` into `CONSENT_VERSION` (catalog: type, version, title, summary, body_s3_key + body_sha256, scope_schema, effective_from/to, approval fields) + `CUSTOMER_CONSENT` (join: `customer_id` + `consent_version_id` FK, granted_at, revoked_at, granted_channel, scope, ip, user_agent). Add partial unique index `WHERE effective_to IS NULL` on `CONSENT_VERSION(consent_type)`. | Q36 | `CUSTOMER_CONSENT`, new `CONSENT_VERSION` |
 
-Items 6, 7, 10 are the biggest schema changes and should probably land as one commit each with the associated workflow-doc updates.
+Items 7 and 10 are the biggest remaining schema changes and should probably land as one commit each with the associated workflow-doc updates. Item 6 has landed.

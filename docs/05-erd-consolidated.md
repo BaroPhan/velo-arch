@@ -213,6 +213,11 @@ erDiagram
         string sha256
         int record_count
         bigint total_credits_cents
+        string sig_algo "e.g. RSA-PSS-SHA256|ECDSA-P256-SHA256"
+        string sig_value "base64 signature bytes from sponsor"
+        string sig_key_id "sponsor's key id"
+        string sig_version "sponsor's signing scheme version"
+        boolean sig_verified
         string status "RECEIVED|PARSED|POSTED|QUARANTINED"
         timestamp received_at
     }
@@ -223,6 +228,10 @@ erDiagram
         string sponsor_msg_id UK
         string end_to_end_id
         jsonb raw_payload
+        string sig_algo "e.g. RSA-PSS-SHA256|ECDSA-P256-SHA256"
+        string sig_value "base64 signature bytes from sponsor"
+        string sig_key_id "sponsor's key id"
+        string sig_version "sponsor's signing scheme version"
         boolean sig_verified
         string status "RECEIVED|POSTED|REJECTED|REPLAY_QUEUED"
         timestamp received_at
@@ -330,3 +339,4 @@ erDiagram
 - Fraud scores (`fraud_assessment` table) — `TRANSACTION.device_context` already captures raw inputs.
 - Reg-reporting artifacts (TTR/SMR/IFTI) — downstream consumers of the audit lake.
 - CDR consent register — separate bounded context; consumes `CUSTOMER_CONSENT` events.
+- **Sponsor signing-key registry.** Key material, rotation, and revocation are the **sponsor's** responsibility, not ours. We just verify what the sponsor sends and store the `sig_key_id` / `sig_version` they claim so the message is auditable end-to-end. If we ever need to independently verify against a pinned copy of the sponsor's public key, we'll add a `SPONSOR_SIGNING_KEY` table then — not before.

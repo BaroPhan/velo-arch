@@ -1389,11 +1389,11 @@ The following corrections are applied in **separate commits** so they're easy to
 
 **From round 2 (Q22–Q30):**
 
-5. **Add cryptographic-audit fields to `INBOUND_FILE` and `INBOUND_MESSAGE`**: `sig_algo`, `sig_value`, `sig_key_id`, `sig_version`, `sig_verified_by_key_id` (Q27). Consistent naming across both entities. Add a `SPONSOR_SIGNING_KEY` registry table for key material + rotation lifecycle.
+5. ✅ **APPLIED.** Add cryptographic-audit fields to `INBOUND_FILE` and `INBOUND_MESSAGE`: `sig_algo`, `sig_value`, `sig_key_id`, `sig_version`, `sig_verified` (Q27). Consistent naming across both entities. **Deliberately not added**: `SPONSOR_SIGNING_KEY` registry table (sponsor owns their key lifecycle, not us — see ERD "not in roadmap" note) and `sig_verified_by_key_id` (redundant given the sponsor sends `sig_key_id` + `sig_version` on every message). Applied in `docs/05-erd-consolidated.md`.
 6. **Rename `RECON_BREAK` columns to child table `RECON_BREAK_DECISION`** for consistency with `APPLICATION_DECISION` pattern (Q22). Post-MVP refactor; document as strategic direction.
 7. **Explicitly document the daily reconciliation suite as four checks (A, B, C, D)** in `docs/workflows/02-inbound-direct-entry.md`; add per-account projection sanity check (D) alongside the aggregate checks (Q28).
 
-Items 5–7 are proposed corrections — not yet applied — so they can be reviewed and discussed before the ERD is touched again.
+Items 6 and 7 remain proposed corrections — not yet applied — so they can be reviewed and discussed before the ERD is touched again. Item 5 has landed.
 
 ---
 
