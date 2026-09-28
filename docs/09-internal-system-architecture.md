@@ -134,8 +134,13 @@ Everything a Velo engineer needs on one page — **every service, every store, e
 Diagrams 3–6 are the same thing sliced by trigger type (request / event / schedule / boundary). Come back to this one when you want the whole picture at once.
 
 ```mermaid
+---
+config:
+  flowchart:
+    defaultRenderer: elk
+---
 flowchart TB
-    %% ─── Top row: clients, plus the sponsor as SOURCE of the inbound webhook ───
+    %% ─── Row 1: Clients (with the sponsor as SENDER at top-right) ───
     subgraph Clients
       direction LR
       CA[Customer App]:::cli
@@ -143,7 +148,7 @@ flowchart TB
       SP1([Sponsor Bank<br/>sends NPP webhook +<br/>drops SFTP files]):::ext
     end
 
-    %% ─── Ingress ───
+    %% ─── Row 2: Ingress ───
     subgraph Ingress["Ingress  (3 API surfaces)"]
       direction LR
       CAPI[Customer API]:::ing
@@ -151,91 +156,104 @@ flowchart TB
       WHR[Webhook Receiver]:::ing
     end
 
-    %% ─── Domain services ───
-    subgraph Domain["Velo Domain Services  (modular monolith)"]
+    %% ─── Row 3: Domain (left) + Anti-Corruption Layer (right) ───
+    subgraph MidRow[" "]
       direction LR
-      subgraph CustGrp["Customer-facing"]
-        direction TB
-        Id[Identity]:::svc
-        Onb[Onboarding]:::svc
-        Acc[Account]:::svc
-        Tx[Transfers]:::svc
-        PS[PayID]:::svc
-      end
-      subgraph MoneyGrp["Money movement"]
-        direction TB
-        PIn[Payments-In]:::svc
-        Int[Interest]:::svc
-        Led[Ledger<br/><i>sole writer</i>]:::hub
-      end
-      subgraph SupGrp["Support / Ops"]
-        direction TB
+      subgraph Domain["Velo Domain Services  (modular monolith)"]
+        direction LR
+        subgraph CustGrp["Customer-facing"]
+          direction TB
+          Id[Identity]:::svc
+          Onb[Onboarding]:::svc
+          Acc[Account]:::svc
+          Tx[Transfers]:::svc
+          PS[PayID]:::svc
+        end
+        subgraph MoneyGrp["Money movement"]
+          direction TB
+          PIn[Payments-In]:::svc
+          Int[Interest]:::svc
+          Led[Ledger<br/><i>sole writer</i>]:::hub
+        end
         Recon[Reconciliation]:::svc
-        Notif[Notifications]:::svc
+      end
+      subgraph AclCol["Anti-Corruption Layer"]
+        direction TB
+        SBA[Sponsor-Bank Adapter<br/><i>only sponsor-touching module</i>]:::acl
+        SP2([Sponsor Bank<br/>receives REST +<br/>hosts SFTP server]):::ext
       end
     end
 
-    %% ─── ACL + the sponsor as RECEIVER of our REST calls ───
-    subgraph AclRow[" "]
+    %% ─── Row 4: State (Postgres + Redis + S3s) ───
+    subgraph State["Data  (state)"]
       direction LR
-      SBA[Sponsor-Bank Adapter<br/><i>only sponsor-touching module</i>]:::acl
-      SP2([Sponsor Bank<br/>receives REST + SFTP]):::ext
-    end
-
-    %% ─── Data + messaging ───
-    subgraph DataMsg["Data + Messaging"]
-      direction LR
-      PG[(Postgres)]:::data
+      PG[(Postgres<br/><i>+ Outbox table</i>)]:::data
       Rd[(Redis)]:::data
-      Ob[(Outbox<br/>in Postgres)]:::data
-      Kf[[Kafka]]:::data
-      Sq[/SQS/]:::data
-      S3K[(S3 KYC)]:::data
+      S3K[(S3 KYC docs)]:::data
       S3I[(S3 inbound-files)]:::data
-      S3A[(S3 audit-lake)]:::data
     end
 
-    %% ─── Scheduler ───
-    subgraph Sched["Scheduler"]
+    %% ─── Row 5: Event backbone (async fan-out) ───
+    subgraph EventBus["Event backbone  (Postgres → CDC → Kafka → consumers)"]
       direction LR
-      Cr[EventBridge cron]:::infra
-      Jb[Interest · Recon · SFTP · Cleanup jobs]:::job
+      CDC[Debezium CDC<br/>tails Postgres WAL]:::infra
+      Kf[[Kafka event bus]]:::data
+      S3A[(S3 audit-lake<br/>7-yr Object Lock)]:::data
     end
 
-    %% ═══ ~20 arrows total — grouped where possible ═══
+    %% ─── Row 6: Notification delivery chain ───
+    subgraph NotifRow["Notification delivery"]
+      direction LR
+      Notif[Notifications svc]:::svc
+      Sq[/SQS per-channel/]:::data
+      Ext([SES · Twilio · APNs / FCM]):::ext
+    end
 
-    %% Client → Ingress (3)
+    %% ─── Left sidebar: Scheduler ───
+    subgraph Sched["Scheduler  (internal cron)"]
+      direction TB
+      Cr[EventBridge cron]:::infra
+      Jb[Interest · Recon · SFTP ·<br/>Cleanup jobs]:::job
+    end
+
+    %% ═══ ~22 arrows, all forward — no back-arrows ═══
+
+    %% Row 1 → Row 2 : client → ingress (3)
     CA --> CAPI
     OW --> OAPI
-    SP1 ==>|mTLS webhook| WHR
+    SP1 ==>|mTLS + HMAC| WHR
 
-    %% Ingress → Domain (3 group-level arrows, not 11 individual)
+    %% Row 2 → Row 3 : ingress → domain (3 group-level, not 11 individual)
     CAPI --> CustGrp
     OAPI --> Domain
     WHR --> MoneyGrp
 
-    %% Domain state ownership (3 arrows, not 8 individual)
-    Domain --> PG
-    MoneyGrp --> Rd
-    Onb --> S3K
-
-    %% Event backbone (5)
-    Domain --> Ob
-    Ob -->|Debezium CDC| Kf
-    Kf --> Notif
-    Kf --> S3A
-    Notif --> Sq
-
-    %% Sponsor boundary — one funnel through the ACL (4)
+    %% Row 3 sponsor funnel : 3 services → SBA → SP2 (4)
     MoneyGrp --> SBA
     PS --> SBA
     Recon --> SBA
     SBA ==>|REST + mTLS| SP2
 
-    %% Scheduler → services + inbound files (3)
+    %% Row 3 → Row 4 : domain owns state (3 arrows, not 8)
+    Domain --> PG
+    MoneyGrp --> Rd
+    Onb --> S3K
+
+    %% Row 4 → Row 5 : outbox event backbone (all forward)
+    PG -->|WAL| CDC
+    CDC --> Kf
+    Kf --> S3A
+
+    %% Row 5 → Row 6 : event → notification delivery
+    Kf --> Notif
+    Notif --> Sq
+    Sq --> Ext
+
+    %% Scheduler sidebar → services + inbound files (4)
     Cr --> Jb
     Jb --> MoneyGrp
-    Jb -.->|SFTP puller<br/>writes raw files;<br/>S3 event → SQS → Payments-In / Recon| S3I
+    Jb --> Recon
+    Jb -.->|SFTP puller writes files;<br/>S3 event → SQS → Payments-In / Recon| S3I
 
     classDef cli fill:#dbeafe,stroke:#1e40af,color:#111
     classDef ing fill:#bfdbfe,stroke:#1e3a8a,color:#111
@@ -248,16 +266,28 @@ flowchart TB
     classDef ext fill:#e5e7eb,stroke:#374151,color:#111
 ```
 
-> **`SP1` and `SP2` are the same external Sponsor Bank** — shown twice for layout clarity. `SP1` is the sponsor as *sender* (NPP webhook + SFTP files → into us). `SP2` is the sponsor as *receiver* (REST / SFTP called *from* our Sponsor-Bank Adapter). Splitting the node keeps the diagram flowing top-to-bottom without a long backward arrow crossing the whole canvas.
+> **Three notational shortcuts to remove overlap** (with no loss of information):
 >
-> **SFTP inbound chain shown as one collapsed arrow.** The label on the `Jb -.-> S3I` edge tells the whole story: SFTP puller drops raw files into S3 → S3 event fires SQS → Payments-In and Recon consume. Full detail lives in Diagrams 5 and 6.
+> 1. **`SP1` and `SP2` are the same external Sponsor Bank** — shown twice for layout clarity. `SP1` is the sponsor as *sender* (top-right of Clients row); `SP2` is the sponsor as *receiver* (right side of the ACL column). Splitting the node avoids a long backward arrow across the whole canvas.
+> 2. **`Notifications`** is a domain service; it's placed in its own **delivery band** at the bottom so the entire event fan-out (`Postgres → CDC → Kafka → Notif → SQS → external`) is a single downward chain with no back-arrows.
+> 3. **SFTP inbound chain** collapsed into one dashed arrow with an inline label. The full detail (`SFTP puller → S3 → SQS → Payments-In / Recon`) lives in Diagrams 5 and 6.
+>
+> The diagram uses **ELK layout** (not Mermaid's default Dagre) for a cleaner routing of the multi-way arrows.
 
-**Reading this diagram in three passes:**
-1. **Vertical spine** — Clients → Ingress → Domain → Data / Messaging. This is the request path for anything that comes in via HTTP.
-2. **ACL row (just below Domain)** — every sponsor-touching service (Payments-In, PayID, Reconciliation) funnels through the single Sponsor-Bank Adapter, which is the *only* code that talks to the sponsor.
-3. **Scheduler (bottom)** — cron-driven work. Two outputs: (a) triggers money-movement services on a schedule, (b) pulls files from the sponsor via SFTP and drops them into S3.
+**Reading this diagram top-to-bottom:**
+1. **Rows 1–2** — Clients enter through one of the 3 API surfaces. Sponsor Bank (`SP1`) enters via the Webhook Receiver.
+2. **Row 3** — Domain services on the left (grouped by role, 10 modules), Anti-Corruption Layer on the right — the *only* module that talks to the sponsor (`SP2`).
+3. **Row 4** — State. Every domain service writes into its own Postgres schema; money-movement services also cache in Redis; Onboarding writes uploaded ID docs to S3-KYC.
+4. **Rows 5–6** — Async event backbone. Postgres WAL → Debezium CDC → Kafka → (a) audit-lake mirror, (b) Notifications service → per-channel SQS → external providers.
+5. **Left sidebar** — Scheduler triggers money-movement services and pulls SFTP files into S3-inbound.
 
-**Arrow-reduction technique** — instead of drawing an arrow from every service to Postgres (8 arrows), a single arrow from the `Domain` subgraph to `PG` says "every service in Domain owns rows in Postgres". Same trick for `Ingress → Domain`, `Domain → Outbox`, and the sponsor funnel. Total: ~20 arrows for ~26 visible nodes — less than half the old diagram's edge count. When you need per-service granularity, jump to Diagrams 3–6.
+**Arrow-reduction techniques used** (roughly half the edge count of the original mega-diagram):
+- **Group-level arrows** instead of per-service (`Domain → PG` replaces 8 individual arrows; `Ingress → CustGrp` replaces 5).
+- **Notifications moved out of Domain visually** so the event chain flows forward without back-arrows.
+- **SFTP inbound chain collapsed** into one labelled dashed arrow.
+- **Sponsor node split** into `SP1` / `SP2` for clean top-to-bottom flow.
+
+Total: ~22 arrows for ~26 visible nodes, every arrow pointing forward. When you need per-service granularity, jump to Diagrams 3–6.
 
 ---
 
