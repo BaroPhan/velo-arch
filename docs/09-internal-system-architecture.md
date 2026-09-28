@@ -131,6 +131,8 @@ flowchart TB
 
 Everything a Velo engineer needs on one page — **every service, every store, every messaging surface visible**, but with cross-arrows kept to the essential story-telling ones. If you had to print one diagram and pin it above your desk, this would be it.
 
+Rendered copy for the submission email: [`docs/exports/architecture-diagram-2.png`](exports/architecture-diagram-2.png).
+
 Diagrams 3–6 are the same thing sliced by trigger type (request / event / schedule / boundary). Come back to this one when you want the whole picture at once.
 
 ```mermaid
