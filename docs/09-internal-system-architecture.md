@@ -138,128 +138,109 @@ Diagrams 3–6 are the same thing sliced by trigger type (request / event / sche
 config:
   flowchart:
     defaultRenderer: elk
+    nodeSpacing: 40
+    rankSpacing: 50
+    padding: 16
 ---
 flowchart TB
-    %% ─── Row 1: Clients (with the sponsor as SENDER at top-right) ───
-    subgraph Clients
+    subgraph B1["1 · Clients"]
       direction LR
       CA[Customer App]:::cli
       OW[Ops Portal]:::cli
-      SP1([Sponsor Bank<br/>sends NPP webhook +<br/>drops SFTP files]):::ext
+      SP1([Sponsor Bank<br/>sends the NPP webhook<br/>and drops SFTP files]):::ext
     end
 
-    %% ─── Row 2: Identity provider + Ingress ───
-    subgraph Edge["Sign-in + ingress"]
+    subgraph B2["2 · Sign-in · password and MFA stay here"]
       direction LR
-      Cog([Cognito<br/>customer pool + ops pool<br/>password · MFA · JWT]):::ext
-      CAPI[Customer API<br/>JWT]:::ing
-      OAPI[Ops API<br/>JWT]:::ing
+      Cog([Cognito<br/>customer pool + ops pool]):::ext
+    end
+
+    subgraph B3["3 · Ingress"]
+      direction LR
+      CAPI[Customer API]:::ing
+      OAPI[Ops API]:::ing
       WHR[Webhook Receiver]:::ing
     end
 
-    %% ─── Row 3: Domain (left) + Anti-Corruption Layer (right) ───
-    subgraph MidRow[" "]
+    subgraph B4["4 · Services"]
       direction LR
-      subgraph Domain["Velo Domain Services  (modular monolith)"]
+      subgraph G1["Customer-facing"]
         direction LR
-        subgraph CustGrp["Customer-facing"]
-          direction TB
-          Id[Identity]:::svc
-          Onb[Onboarding]:::svc
-          Acc[Account]:::svc
-          Tx[Transfers<br/><i>customer send-money</i><br/>validate · limits · step-up<br/>then Ledger.post]:::svc
-          PS[PayID]:::svc
-        end
-        subgraph MoneyGrp["Money movement"]
-          direction TB
-          PIn[Payments-In]:::svc
-          Int[Interest]:::svc
-          Led[Ledger<br/><i>sole writer</i>]:::hub
-        end
-        Recon[Reconciliation]:::svc
+        Id[Identity<br/>verifies JWT at Cognito]:::svc
+        Onb[Onboarding<br/>writes S3 KYC]:::svc
+        Acc[Account]:::svc
+        PS[PayID<br/>calls the adapter]:::svc
       end
-      subgraph AclCol["Anti-Corruption Layer"]
+      subgraph G2["Money movement"]
         direction TB
-        SBA[Sponsor-Bank Adapter<br/><i>only sponsor-touching module</i>]:::acl
-        SP2([Sponsor Bank<br/>receives REST +<br/>hosts SFTP server]):::ext
+        subgraph G2top["These three call Ledger"]
+          direction LR
+          PIn[Payments-In<br/>calls the adapter]:::svc
+          Tx[Transfers<br/>send-money orchestrator]:::svc
+          Int[Interest<br/>cron 23:59]:::svc
+        end
+        Led[Ledger<br/>sole writer of postings]:::hub
+      end
+      subgraph G5["Sponsor boundary"]
+        direction TB
+        Recon[Reconciliation<br/>cron 19:15 · calls the adapter]:::svc
+        SBA[Sponsor-Bank Adapter<br/>only module that talks to the sponsor]:::acl
+        SP2([Sponsor Bank<br/>receives REST · hosts SFTP]):::ext
       end
     end
 
-    %% ─── Row 4: State (Postgres + Redis + S3s) ───
-    subgraph State["Data  (state)"]
+    subgraph B6["5 · Data"]
       direction LR
-      PG[(Postgres<br/>business tables)]:::data
-      OB[(outbox_event<br/><i>the only table CDC publishes</i>)]:::data
-      Rd[(Redis)]:::data
       S3K[(S3 KYC docs)]:::data
-      S3I[(S3 inbound-files)]:::data
+      S3I[(S3 inbound files<br/>SFTP puller, then SQS<br/>to Payments-In and Recon)]:::data
+      Rd[(Redis<br/>balance cache)]:::data
+      PG[(Postgres<br/>business tables)]:::data
+      OB[(outbox_event<br/>only table CDC publishes)]:::data
     end
 
-    %% ─── Row 5: Event backbone (outbox only — not every WAL change) ───
-    subgraph EventBus["Event backbone  (outbox_event → Debezium → Kafka)"]
-      direction LR
-      CDC[Debezium CDC<br/><i>publication = outbox_event</i><br/>business tables are not published]:::infra
-      Kf[[Kafka event bus]]:::data
-      S3A[(S3 audit-lake<br/>7-yr Object Lock)]:::data
-    end
-
-    %% ─── Row 6: Notification delivery chain ───
-    subgraph NotifRow["Notification delivery"]
-      direction LR
-      Notif[Notifications svc]:::svc
-      Sq[/SQS per-channel/]:::data
-      Ext([SES · Twilio · APNs / FCM]):::ext
-    end
-
-    %% ─── Left sidebar: Scheduler ───
-    subgraph Sched["Scheduler  (internal cron)"]
+    subgraph B7["6 · Events and delivery"]
       direction TB
-      Cr[EventBridge cron]:::infra
-      Jb[Interest · Recon · SFTP ·<br/>Cleanup jobs]:::job
+      CDC[Debezium<br/>outbox_event only]:::infra
+      Kf[[Kafka]]:::data
+      subgraph Gfork["Kafka consumers · side by side"]
+        direction LR
+        S3A[(S3 audit lake<br/>7-year Object Lock)]:::data
+        subgraph Gdel["Notification delivery"]
+          direction TB
+          Notif[Notifications]:::svc
+          Sq[/SQS per channel/]:::data
+          Ext([SES · Twilio · APNs]):::ext
+        end
+      end
     end
 
-    %% ═══ ~22 arrows, all forward — no back-arrows ═══
-
-    %% Row 1 → Row 2 : sign-in, then API. Sponsor does not use Cognito.
     CA -->|sign-in + MFA| Cog
     OW -->|sign-in + hardware key| Cog
-    CA -->|Bearer JWT| CAPI
-    OW -->|Bearer JWT| OAPI
-    Id -->|verify JWT via JWKS<br/>step-up MFA| Cog
-    SP1 ==>|mTLS + HMAC| WHR
+    Cog -->|JWT| CAPI
+    Cog -->|JWT| OAPI
+    SP1 -->|mTLS + HMAC| WHR
 
-    %% Row 2 → Row 3 : ingress → domain (3 group-level, not 11 individual)
-    CAPI --> CustGrp
-    OAPI --> Domain
-    WHR --> MoneyGrp
+    CAPI --> G1
+    OAPI --> Recon
+    WHR --> PIn
 
-    %% Row 3 sponsor funnel : 3 services → SBA → SP2 (4)
-    MoneyGrp --> SBA
-    PS --> SBA
+    PIn --> Led
+    Tx --> Led
+    Int --> Led
     Recon --> SBA
-    SBA ==>|REST + mTLS| SP2
+    SBA --> SP2
 
-    %% Row 3 → Row 4 : domain owns state. Outbox row is written in the SAME txn as the business write.
-    Domain --> PG
-    Domain -->|same DB transaction| OB
-    MoneyGrp --> Rd
-    Onb --> S3K
-
-    %% Row 4 → Row 5 : CDC publishes outbox_event only — not every table's WAL
+    B4 --> PG
+    B4 --> Rd
+    B4 --> S3K
+    B4 --> S3I
+    PG -->|same transaction| OB
     OB --> CDC
     CDC --> Kf
     Kf --> S3A
-
-    %% Row 5 → Row 6 : event → notification delivery
     Kf --> Notif
     Notif --> Sq
     Sq --> Ext
-
-    %% Scheduler sidebar → services + inbound files (4)
-    Cr --> Jb
-    Jb --> MoneyGrp
-    Jb --> Recon
-    Jb -.->|SFTP puller writes files;<br/>S3 event → SQS → Payments-In / Recon| S3I
 
     classDef cli fill:#dbeafe,stroke:#1e40af,color:#111
     classDef ing fill:#bfdbfe,stroke:#1e3a8a,color:#111
@@ -268,32 +249,21 @@ flowchart TB
     classDef acl fill:#e9d5ff,stroke:#6b21a8,color:#111,stroke-width:2px
     classDef data fill:#fef3c7,stroke:#92400e,color:#111
     classDef infra fill:#fed7aa,stroke:#9a3412,color:#111
-    classDef job fill:#fff7ed,stroke:#9a3412,color:#111
     classDef ext fill:#e5e7eb,stroke:#374151,color:#111
 ```
 
-> **Three notational shortcuts to remove overlap** (with no loss of information):
->
-> 1. **`SP1` and `SP2` are the same external Sponsor Bank** — shown twice for layout clarity. `SP1` is the sponsor as *sender* (top-right of Clients row); `SP2` is the sponsor as *receiver* (right side of the ACL column). Splitting the node avoids a long backward arrow across the whole canvas.
-> 2. **`Notifications`** is a domain service; it's placed in its own **delivery band** at the bottom so the entire event fan-out (`Postgres → CDC → Kafka → Notif → SQS → external`) is a single downward chain with no back-arrows.
-> 3. **SFTP inbound chain** collapsed into one dashed arrow with an inline label. The full detail (`SFTP puller → S3 → SQS → Payments-In / Recon`) lives in Diagrams 5 and 6.
->
-> The diagram uses **ELK layout** (not Mermaid's default Dagre) for a cleaner routing of the multi-way arrows.
+Each numbered band connects only to the band below it, so arrows run downward instead of back across the boxes. Two layout choices keep it that way:
+
+1. **`SP1` and `SP2` are the same sponsor bank.** `SP1` is the sponsor as sender (top). `SP2` is the sponsor as receiver (inside the sponsor-boundary column). One node would need a line from the bottom of the page back to the top.
+2. **No arrow runs back up to Cognito.** Identity sits in the customer-facing column and its label says it checks the JWT against Cognito's JWKS. The sign-in arrows stop at Cognito, then Cognito's JWT is what the Customer API and Ops API accept.
+3. **Schedulers are labels, not a sidebar.** Interest says `cron 23:59`, Reconciliation says `cron 19:15`, and the inbound-files bucket says the SFTP puller writes there. A sidebar of cron arrows was cutting through the service boxes. The job list is Diagram 5.
 
 **Reading this diagram top-to-bottom:**
-1. **Rows 1–2** — The customer app and the ops portal sign in to **Cognito** (separate user pools). Cognito owns the password and MFA; the app then calls Customer API or Ops API with the JWT. **Identity** checks that JWT against Cognito's JWKS and asks Cognito for step-up on sensitive actions. Velo stores only `cognito_sub`. Sponsor Bank (`SP1`) does not use Cognito; it enters via the Webhook Receiver with mTLS + HMAC.
-2. **Row 3** — Domain services on the left (grouped by role, 10 modules), Anti-Corruption Layer on the right — the *only* module that talks to the sponsor (`SP2`).
-3. **Row 4** — State. Every domain service writes into its own Postgres schema **and**, in the same transaction, an `outbox_event` row. Money-movement services also cache in Redis; Onboarding writes uploaded ID docs to S3-KYC.
-4. **Rows 5–6** — Async event backbone. Debezium's publication is **`outbox_event` only** — it does not publish `transaction`, `posting`, `ledger_account`, or any other business table. Kafka then fans out to (a) the audit-lake mirror and (b) Notifications → per-channel SQS → external providers.
-5. **Left sidebar** — Scheduler triggers money-movement services and pulls SFTP files into S3-inbound.
 
-**Arrow-reduction techniques used** (roughly half the edge count of the original mega-diagram):
-- **Group-level arrows** instead of per-service (`Domain → PG` replaces 8 individual arrows; `Ingress → CustGrp` replaces 5).
-- **Notifications moved out of Domain visually** so the event chain flows forward without back-arrows.
-- **SFTP inbound chain collapsed** into one labelled dashed arrow.
-- **Sponsor node split** into `SP1` / `SP2` for clean top-to-bottom flow.
-
-Total: ~22 arrows for ~26 visible nodes, every arrow pointing forward. When you need per-service granularity, jump to Diagrams 3–6.
+1. **Bands 1–3** — Customer app and ops portal sign in to Cognito (separate pools). Cognito holds the password and MFA. The APIs accept the JWT. The sponsor does not use Cognito; `SP1` calls the webhook receiver.
+2. **Band 4** — Three columns, and no arrow crosses from one column into another. Customer-facing services sit on the left. In the middle, Payments-In, Transfers, and Interest each call Ledger, which is the only writer of postings. On the right, Reconciliation calls the Sponsor-Bank Adapter, and the adapter is the only module that calls `SP2`. PayID and Payments-In are the other two adapter callers; that is written on their boxes so the lines do not have to cross the Ledger column.
+3. **Band 5** — Postgres holds the business tables. The outbox row is inserted in the same transaction. Redis is the money-movement cache. Onboarding writes KYC docs to S3. The SFTP puller writes sponsor files to the inbound bucket; S3 then notifies Payments-In and Reconciliation through SQS (Diagram 6).
+4. **Band 6** — Debezium publishes `outbox_event` only. Kafka then splits to two consumers sitting side by side: the audit lake, and Notifications → SQS → SES, Twilio, and APNs. Neither arrow passes through the other box.
 
 ---
 
